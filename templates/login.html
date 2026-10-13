@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Подключение к серверу — Amnezia VPN{% endblock %}
+
+{% block content %}
+<div class="card login-card">
+    <h1>Подключение к серверу</h1>
+    <p class="muted">
+        Введите данные SSH-доступа к вашему VPS. Панель подключится и покажет
+        состояние контейнеров Amnezia VPN.
+    </p>
+
+    <form method="post" action="{{ url_for('connect') }}">
+        <div class="form-row">
+            <label for="host">Адрес сервера</label>
+            <input id="host" name="host" type="text" required
+                   placeholder="1.2.3.4 или vpn.example.com"
+                   value="{{ prefill.host or '' }}">
+        </div>
+
+        <div class="form-row form-row-inline">
+            <div>
+                <label for="port">SSH-порт</label>
+                <input id="port" name="port" type="number" min="1" max="65535"
+                       value="{{ prefill.port or 22 }}" required>
+            </div>
+            <div>
+                <label for="username">Логин</label>
+                <input id="username" name="username" type="text" required
+                       value="{{ prefill.username or 'root' }}">
+            </div>
+        </div>
+
+        <div class="form-row">
+            <label for="password">Пароль</label>
+            <input id="password" name="password" type="password" required
+                   autocomplete="current-password">
+        </div>
+
+        <button type="submit" class="btn btn-primary btn-block">Подключиться</button>
+    </form>
+
+    <p class="hint">
+        Пароль используется только для установки SSH-соединения и хранится
+        в памяти процесса до отключения.
+    </p>
+</div>
+{% endblock %}

@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Клиенты {{ container_label }} — Amnezia VPN{% endblock %}
+
+{% block topbar_right %}
+    <span class="host-info">{{ container_label }} · <code>{{ container_name }}</code></span>
+    <a href="{{ url_for('index') }}" class="btn btn-ghost">← Назад</a>
+{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h1>Клиенты: {{ container_label }}</h1>
+        <button class="btn btn-ghost" onclick="location.reload()">Обновить</button>
+    </div>
+
+    {% if supports_clients %}
+    <form method="post"
+          action="{{ url_for('add_client', container_name=container_name) }}"
+          class="add-client-form">
+        <input type="text" name="client_name" placeholder="Имя нового клиента"
+               maxlength="64" required>
+        <button type="submit" class="btn btn-primary">Создать клиента</button>
+    </form>
+    {% else %}
+    <p class="muted">Для этого протокола создание клиентов через панель не поддерживается.</p>
+    {% endif %}
+
+    {% if clients %}
+    <table class="container-table">
+        <thead>
+            <tr>
+                <th>Имя</th>
+                <th>ID</th>
+                <th>IP</th>
+                <th>Последнее рукопожатие</th>
+                <th>Трафик ↓ / ↑</th>
+                <th>Создан</th>
+                <th class="col-actions">Действия</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for c in clients %}
+            <tr>
+                <td>
+                    <strong>{{ c.name }}</strong>
+                    {% if c.name_hint %}<div class="status-raw">{{ c.name_hint }}</div>{% endif %}
+                    {% if not c.in_table %}<div class="status-raw">нет в clientsTable</div>{% endif %}
+                </td>
+                <td><code title="{{ c.id }}">{{ c.id[:16] }}{% if c.id|length > 16 %}…{% endif %}</code></td>
+                <td>{{ c.allowed_ips or "—" }}</td>
+                <td>{{ c.handshake or "—" }}</td>
+                <td>{% if c.download or c.upload %}{{ c.download or "0" }} / {{ c.upload or "0" }}{% else %}—{% endif %}</td>
+                <td class="status-raw">{{ c.created or "—" }}</td>
+                <td class="col-actions">
+                    <form action="{{ url_for('delete_client', container_name=container_name) }}"
+                          method="post" class="inline-form"
+                          onsubmit="return confirm({{ ('Удалить клиента ' ~ c.name ~ '?') | tojson | forceescape }});">
+                        <input type="hidden" name="client_id" value="{{ c.id }}">
+                        <input type="hidden" name="client_name" value="{{ c.name }}">
+                        <button type="submit" class="btn btn-danger">Удалить</button>
+                    </form>
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="muted" style="margin-top: 16px;">Клиентов пока нет.</p>
+    {% endif %}
+</div>
+{% endblock %}

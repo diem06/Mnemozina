@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Контейнеры — Amnezia VPN{% endblock %}
+
+{% block topbar_right %}
+    <span class="host-info">{{ username }}@{{ host }}</span>
+    <a href="{{ url_for('create_container') }}" class="btn btn-primary">+ Создать контейнер</a>
+    <a href="{{ url_for('disconnect') }}" class="btn btn-ghost">Отключиться</a>
+{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h1>Контейнеры Amnezia VPN</h1>
+        <button id="refresh-btn" class="btn btn-ghost" onclick="location.reload()">
+            Обновить
+        </button>
+    </div>
+
+    <table class="container-table">
+        <thead>
+            <tr>
+                <th>Протокол</th>
+                <th>Контейнер</th>
+                <th>Статус</th>
+                <th>ID</th>
+                <th class="col-actions">Действия</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for c in containers %}
+            <tr>
+                <td><strong>{{ c.label }}</strong></td>
+                <td><code>{{ c.name }}</code>{% if c.image %}<div class="status-raw">{{ c.image }}</div>{% endif %}</td>
+                <td>
+                    {% if not c.exists %}
+                        <span class="badge badge-missing">не создан</span>
+                    {% elif c.running %}
+                        <span class="badge badge-ok">работает</span>
+                    {% else %}
+                        <span class="badge badge-stopped">остановлен</span>
+                    {% endif %}
+                    <div class="status-raw">{{ c.status }}</div>
+                </td>
+                <td><code>{{ c.id }}</code></td>
+                <td class="col-actions">
+                    {% if c.exists %}
+                        {% if c.supports_clients and c.running %}
+                        <a href="{{ url_for('list_clients', container_name=c.name) }}"
+                           class="btn btn-primary">Клиенты</a>
+                        {% endif %}
+                        {% if not c.running %}
+                        <form action="{{ url_for('container_action', container_name=c.name, action='start') }}"
+                              method="post" class="inline-form">
+                            <button type="submit" class="btn btn-ok">Запустить</button>
+                        </form>
+                        {% else %}
+                        <form action="{{ url_for('container_action', container_name=c.name, action='stop') }}"
+                              method="post" class="inline-form"
+                              onsubmit="return confirm('Остановить {{ c.label }}?');">
+                            <button type="submit" class="btn btn-danger">Остановить</button>
+                        </form>
+                        <form action="{{ url_for('container_action', container_name=c.name, action='restart') }}"
+                              method="post" class="inline-form">
+                            <button type="submit" class="btn btn-warn">Перезапустить</button>
+                        </form>
+                        {% endif %}
+                        <button type="button" class="btn btn-ghost"
+                                onclick="showLogs('{{ c.name }}', '{{ c.label }}')">
+                            Логи
+                        </button>
+                    {% else %}
+                        <span class="muted">—</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div id="logs-modal" class="modal hidden">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2 id="logs-title">Логи</h2>
+            <button type="button" class="btn btn-ghost" onclick="closeLogs()">Закрыть</button>
+        </div>
+        <pre id="logs-body" class="logs-body">Загрузка…</pre>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function showLogs(name, label) {
+    const modal = document.getElementById('logs-modal');
+    const title = document.getElementById('logs-title');
+    const body  = document.getElementById('logs-body');
+
+    title.textContent = 'Логи: ' + label + ' (' + name + ')';
+    body.textContent = 'Загрузка…';
+    modal.classList.remove('hidden');
+
+    try {
+        const resp = await fetch('/logs/' + encodeURIComponent(name));
+        const data = await resp.json();
+        if (data.error) {
+            body.textContent = 'Ошибка: ' + data.error;
+        } else {
+            body.textContent = data.logs || '(пусто)';
+        }
+    } catch (e) {
+        body.textContent = 'Не удалось получить логи: ' + e;
+    }
+}
+
+function closeLogs() {
+    document.getElementById('logs-modal').classList.add('hidden');
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeLogs();
+});
+</script>
+{% endblock %}

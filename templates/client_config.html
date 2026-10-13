@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Конфиг клиента {{ client_name }} — Amnezia VPN{% endblock %}
+
+{% block topbar_right %}
+    <a href="{{ url_for('list_clients', container_name=container_name) }}"
+       class="btn btn-ghost">← К списку клиентов</a>
+{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h1>Клиент «{{ client_name }}» создан</h1>
+    </div>
+    <p class="muted">
+        Протокол: {{ container_label }} · Контейнер: <code>{{ container_name }}</code>
+    </p>
+
+    <p class="hint" style="margin-bottom: 12px;">
+        Скопируйте конфиг и сохраните его — после закрытия страницы он
+        не будет показан снова: приватный ключ клиента на сервере не хранится.
+        Файл .conf импортируется в AmneziaVPN / AmneziaWG.
+    </p>
+
+    <textarea id="client-config" class="config-output" readonly rows="16">{{ config }}</textarea>
+
+    <div class="config-actions">
+        <button type="button" class="btn btn-primary" onclick="copyConfig()">
+            Скопировать
+        </button>
+        <button type="button" class="btn btn-ghost" onclick="downloadConfig()">
+            Скачать файл
+        </button>
+        <a href="{{ url_for('list_clients', container_name=container_name) }}"
+           class="btn btn-ghost">Готово</a>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function copyConfig() {
+    const ta = document.getElementById('client-config');
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    navigator.clipboard.writeText(ta.value).then(() => {
+        alert('Конфиг скопирован в буфер обмена');
+    }).catch(() => {
+        document.execCommand('copy');
+        alert('Конфиг скопирован');
+    });
+}
+
+function downloadConfig() {
+    const ta = document.getElementById('client-config');
+    const blob = new Blob([ta.value], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = {{ filename | tojson }};
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+</script>
+{% endblock %}
