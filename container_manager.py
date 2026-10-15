@@ -573,15 +573,71 @@ class ContainerManager:
 
         # 3. Регистрируем в clientsTable — так клиента увидит и приложение AmneziaVPN
         self._table_add(container, pub, client_name)
+        # Приватный ключ нужен, чтобы позже собрать ссылку и QR из списка клиентов.
+        self._save_wg_secret(container, pub, priv)
 
-        # 4. Собираем клиентский конфиг (server_scripts/awg/template.conf)
+        config_text = self._compose_wg_config(
+            container, interface, priv, f"{client_ip}/32", server_pub, psk,
+        )
+        return {
+            "ok": True, "client": client_name, "config": config_text,
+            "filename": f"{self._safe_filename(client_name)}.conf", "error": None,
+        }
+
+    def _wg_secrets_path(self, container: str) -> str:
+        return f"{WG_PROFILES[container]['dir']}/panel_client_secrets.json"
+
+    def _load_wg_secrets(self, container: str) -> dict[str, str]:
+        raw = self._read(container, self._wg_secrets_path(container)).strip()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(key): str(value) for key, value in data.items() if key and value}
+
+    def _save_wg_secret(self, container: str, public_key: str, private_key: str) -> None:
+        stored = self._load_wg_secrets(container)
+        stored[public_key] = private_key
+        self._write(
+            container,
+            self._wg_secrets_path(container),
+            json.dumps(stored, indent=2) + "\n",
+        )
+
+    def _drop_wg_secret(self, container: str, public_key: str) -> None:
+        stored = self._load_wg_secrets(container)
+        if public_key not in stored:
+            return
+        del stored[public_key]
+        self._write(
+            container,
+            self._wg_secrets_path(container),
+            json.dumps(stored, indent=2) + "\n",
+        )
+
+    def _compose_wg_config(
+        self,
+        container: str,
+        interface: dict,
+        private_key: str,
+        client_address: str,
+        server_public: str,
+        psk: str,
+    ) -> str:
+        prof = WG_PROFILES[container]
+        if "/" not in client_address:
+            client_address = f"{client_address}/32"
         port = interface.get("ListenPort") or "51820"
         dns1, dns2 = self._dns()
         lines = [
             "[Interface]",
-            f"Address = {client_ip}/32",
+            f"Address = {client_address}",
             f"DNS = {dns1}, {dns2}",
-            f"PrivateKey = {priv}",
+            f"PrivateKey = {private_key}",
         ]
         is_awg3 = False
         if prof["awg"]:
@@ -595,7 +651,7 @@ class ContainerManager:
         lines += [
             "",
             "[Peer]",
-            f"PublicKey = {server_pub}",
+            f"PublicKey = {server_public}",
         ]
         if psk:
             lines.append(f"PresharedKey = {psk}")
@@ -605,10 +661,38 @@ class ContainerManager:
             f"PersistentKeepalive = {'25-35' if is_awg3 else '25'}",
             "",
         ]
-        return {
-            "ok": True, "client": client_name, "config": "\n".join(lines),
-            "filename": f"{self._safe_filename(client_name)}.conf", "error": None,
-        }
+        return "\n".join(lines)
+
+    def _wg_client_config(self, container: str, client_id: str) -> str:
+        prof = WG_PROFILES[container]
+        conf = self._read(container, prof["conf"])
+        if not conf.strip():
+            raise SSHError(f"Не найден конфиг сервера {prof['conf']} в контейнере {container}")
+        interface, peers = _parse_wg_conf(conf)
+        peer = next((item for item in peers if item.get("PublicKey") == client_id), None)
+        if peer is None:
+            raise SSHError("Клиент не найден")
+        private_key = self._load_wg_secrets(container).get(client_id, "")
+        if not private_key:
+            raise SSHError(
+                "Приватный ключ этого клиента на сервере не сохранён. "
+                "Ссылка и QR доступны для клиентов, созданных в этой версии панели."
+            )
+        server_pub = self._read(container, f"{prof['dir']}/wireguard_server_public_key.key").strip()
+        if not server_pub and interface.get("PrivateKey"):
+            _, server_pub, _ = self._exec(
+                container, f"{prof['bin']} pubkey",
+                input_data=interface["PrivateKey"] + "\n",
+            )
+            server_pub = server_pub.strip()
+        if not server_pub:
+            raise SSHError("Не удалось получить публичный ключ сервера")
+        psk = (peer.get("PresharedKey") or "").strip() or \
+            self._read(container, f"{prof['dir']}/wireguard_psk.key").strip()
+        allowed = (peer.get("AllowedIPs") or "").split(",")[0].strip() or "10.8.1.1/32"
+        return self._compose_wg_config(
+            container, interface, private_key, allowed, server_pub, psk,
+        )
 
     @staticmethod
     def _safe_filename(name: str) -> str:
@@ -630,12 +714,24 @@ class ContainerManager:
         if code != 0:
             raise SSHError(err.strip() or out.strip() or "Не удалось выпустить сертификат")
 
+        self._table_add(container, client_id, client_name)
+        return {
+            "ok": True,
+            "client": client_name,
+            "config": self._openvpn_client_config(container, client_id),
+            "filename": f"{self._safe_filename(client_name)}.ovpn",
+            "error": None,
+        }
+
+    def _openvpn_client_config(self, container: str, client_id: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", client_id):
+            raise SSHError("Некорректный идентификатор клиента")
         ca = self._pem_only(self._read(container, f"{OPENVPN_DIR}/pki/ca.crt"))
         cert = self._pem_only(self._read(container, f"{OPENVPN_DIR}/pki/issued/{client_id}.crt"))
         key = self._pem_only(self._read(container, f"{OPENVPN_DIR}/pki/private/{client_id}.key"))
         ta = "\n".join(
-            l for l in self._read(container, f"{OPENVPN_DIR}/ta.key").splitlines()
-            if not l.strip().startswith("#")
+            line for line in self._read(container, f"{OPENVPN_DIR}/ta.key").splitlines()
+            if not line.strip().startswith("#")
         ).strip()
         if not (ca and cert and key):
             raise SSHError("Не удалось прочитать сертификаты клиента")
@@ -646,11 +742,11 @@ class ContainerManager:
             parts = line.strip().split(None, 1)
             if parts:
                 opts.setdefault(parts[0], parts[1] if len(parts) > 1 else "")
-        port_code, port_out, _ = self.ssh.run(
+        _port_code, port_out, _ = self.ssh.run(
             f"{self.docker} port {container} 2>/dev/null | head -n1", timeout=self.timeout
         )
-        m = re.search(r":(\d+)\s*$", port_out.strip())
-        port = m.group(1) if m else opts.get("port", "1194")
+        match = re.search(r":(\d+)\s*$", port_out.strip())
+        port = match.group(1) if match else opts.get("port", "1194")
         proto = opts.get("proto", "udp")
         dns1, dns2 = self._dns()
 
@@ -671,11 +767,7 @@ class ContainerManager:
         ]
         if ta and "tls-auth" in opts:
             cfg += ["<tls-auth>", ta, "</tls-auth>"]
-        self._table_add(container, client_id, client_name)
-        return {
-            "ok": True, "client": client_name, "config": "\n".join(cfg) + "\n",
-            "filename": f"{self._safe_filename(client_name)}.ovpn", "error": None,
-        }
+        return "\n".join(cfg) + "\n"
 
     def _add_xray_client(self, container: str, client_name: str) -> dict:
         config = self._xray_config(container)
@@ -725,14 +817,39 @@ class ContainerManager:
         return {"ok": True}
 
     def client_config(self, container: str, client_id: str, client_name: str = "Client") -> dict:
-        """Возвращает конфиг существующего клиента через общий builder."""
-        if self.protocol_of(container) != "xray":
-            return {"ok": False, "error": "Повторная выдача конфига поддержана для XRay"}
-        config = self._xray_config(container)
-        inbound = self._xray_inbound(config)
-        if any(c.get("id") == client_id for c in inbound.get("settings", {}).get("clients", [])):
-            return {"ok": True, "config": self._xray_link(container, inbound, client_id, client_name)}
-        return {"ok": False, "error": "Клиент не найден"}
+        """Ссылка или конфиг, которым клиент подключается. Его же кодирует QR."""
+        fail = lambda msg: {"ok": False, "config": "", "link": "", "error": msg}  # noqa: E731
+        if not self._validate_container(container) or not client_id:
+            return fail("Некорректные параметры клиента")
+        protocol = self.protocol_of(container)
+        try:
+            if not self.container_running(container):
+                return fail(f"Контейнер {container} не запущен")
+            if protocol == "wireguard":
+                link = self._wg_client_config(container, client_id)
+                filename = f"{self._safe_filename(client_name)}.conf"
+            elif protocol == "openvpn":
+                link = self._openvpn_client_config(container, client_id)
+                filename = f"{self._safe_filename(client_name)}.ovpn"
+            elif protocol == "xray":
+                config = self._xray_config(container)
+                inbound = self._xray_inbound(config)
+                clients = inbound.get("settings", {}).get("clients", [])
+                if not any(item.get("id") == client_id for item in clients):
+                    return fail("Клиент не найден")
+                link = self._xray_link(container, inbound, client_id, client_name)
+                filename = f"{self._safe_filename(client_name)}.txt"
+            else:
+                return fail("Протокол не поддерживает ссылку подключения")
+        except SSHError as exc:
+            return fail(str(exc))
+        return {
+            "ok": True,
+            "config": link,
+            "link": link,
+            "filename": filename,
+            "error": None,
+        }
 
     # ------------------------------------------------------------------
     # Удаление клиента
@@ -779,6 +896,7 @@ class ContainerManager:
             if code != 0:
                 self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
         self._table_remove(container, client_id)
+        self._drop_wg_secret(container, client_id)
 
     def _delete_openvpn_client(self, container: str, client_id: str) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", client_id):

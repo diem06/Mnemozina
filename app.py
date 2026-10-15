@@ -446,6 +446,30 @@ def add_client(container_name: str):
     )
 
 
+@app.route("/clients/<container_name>/share", methods=["POST"])
+def client_share(container_name: str):
+    conn = _require_connection()
+    if conn is None:
+        return jsonify({"ok": False, "error": "Нет соединения"}), 401
+
+    if not _is_allowed_container(container_name):
+        return jsonify({"ok": False, "error": "Контейнер не разрешён"}), 403
+
+    client_id = request.form.get("client_id", "").strip()
+    client_name = request.form.get("client_name", "").strip() or "Client"
+    if not client_id:
+        return jsonify({"ok": False, "error": "Не указан клиент"}), 400
+
+    manager = _manager(conn)
+    try:
+        result = manager.client_config(container_name, client_id, client_name)
+    except SSHError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+
 @app.route("/clients/<container_name>/delete", methods=["POST"])
 def delete_client(container_name: str):
     conn = _require_connection()
