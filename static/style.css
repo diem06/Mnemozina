@@ -198,6 +198,15 @@ select:focus { border-color: var(--accent); }
 }
 .col-actions { text-align: right; white-space: nowrap; }
 .inline-form { display: inline-block; margin-left: 4px; }
+.table-wrap { overflow-x: auto; }
+.client-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.client-actions .inline-form { margin-left: 0; }
 
 /* Badges */
 .badge {
@@ -222,7 +231,7 @@ select:focus { border-color: var(--accent); }
     z-index: 100;
     padding: 24px;
 }
-.modal.hidden { display: none; }
+.hidden { display: none; }
 .modal-content {
     background: var(--bg-elev);
     border: 1px solid var(--border);
@@ -233,6 +242,22 @@ select:focus { border-color: var(--accent); }
     display: flex;
     flex-direction: column;
     overflow: hidden;
+}
+.share-modal { max-width: 460px; }
+.share-body { padding: 16px 18px 18px; overflow: auto; }
+.share-qr {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 12px;
+}
+.share-qr:empty { display: none; }
+.share-qr img {
+    width: 240px;
+    height: 240px;
+    background: #fff;
+    padding: 8px;
+    border-radius: 8px;
+    image-rendering: pixelated;
 }
 .modal-header {
     display: flex;

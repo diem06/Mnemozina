@@ -26,7 +26,7 @@ import shlex
 import string
 import time
 import uuid as uuid_module
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from ssh_manager import SSHSession, SSHError
 
@@ -384,10 +384,64 @@ class ContainerManager:
         except json.JSONDecodeError as exc:
             raise SSHError(f"Не удалось разобрать {XRAY_SERVER_CONFIG}: {exc}") from exc
 
+    def _xray_inbound(self, config: dict) -> dict:
+        """Return the VLESS inbound, preferring Reality over unrelated inbounds."""
+        inbounds = config.get("inbounds") or []
+        candidates = [i for i in inbounds if i.get("protocol", "vless") == "vless"]
+        candidates = candidates or inbounds
+        reality = [i for i in candidates if i.get("streamSettings", {}).get("security") == "reality"]
+        if reality:
+            return reality[0]
+        if candidates:
+            return candidates[0]
+        raise SSHError("В конфиге XRay нет inbounds")
+
+    def _xray_link(self, container: str, inbound: dict, client_id: str,
+                   client_name: str = "Client") -> str:
+        """Build a VLESS link from the actual inbound stream settings."""
+        stream = inbound.get("streamSettings", {}) or {}
+        network = str(stream.get("network", "tcp"))
+        security = str(stream.get("security", "none"))
+        params = {"type": network, "security": security, "encryption": "none"}
+        # flow is valid only for TCP/RAW. Existing bad flow values are ignored.
+        client = next((c for c in inbound.get("settings", {}).get("clients", [])
+                       if c.get("id") == client_id), {})
+        if network in ("tcp", "raw") and client.get("flow"):
+            params["flow"] = client["flow"]
+        reality = stream.get("realitySettings", {}) or {}
+        if security == "reality":
+            pbk = self._read(container, f"{XRAY_DIR}/xray_public.key").strip()
+            sid = self._read(container, f"{XRAY_DIR}/xray_short_id.key").strip()
+            params.update({
+                "sni": (reality.get("serverNames") or [""])[0],
+                "fp": (reality.get("fingerprint") or "chrome"),
+                "pbk": pbk,
+                "sid": sid or (reality.get("shortIds") or [""])[0],
+            })
+        sock = stream.get("xhttpSettings", {}) or {}
+        if network == "xhttp":
+            params["path"] = sock.get("path") or "/"
+            params["mode"] = sock.get("mode") or "auto"
+            if sock.get("host"):
+                params["host"] = sock["host"]
+        elif network == "ws":
+            ws = stream.get("wsSettings", {}) or {}
+            params["path"] = ws.get("path") or "/"
+            headers = ws.get("headers", {}) or {}
+            if headers.get("Host") or headers.get("host"):
+                params["host"] = headers.get("Host") or headers.get("host")
+        elif network == "grpc":
+            grpc = stream.get("grpcSettings", {}) or {}
+            if grpc.get("serviceName"):
+                params["serviceName"] = grpc["serviceName"]
+        query = urlencode(params, quote_via=quote)
+        return (f"vless://{quote(str(client_id), safe='')}@{self._server_host()}"
+                f":{inbound.get('port', 443)}?{query}#{quote(client_name, safe='')}")
+
     def _list_xray_clients(self, container: str) -> list[dict]:
         config = self._xray_config(container)
-        inbounds = config.get("inbounds") or [{}]
-        clients = inbounds[0].get("settings", {}).get("clients", [])
+        inbound = self._xray_inbound(config)
+        clients = inbound.get("settings", {}).get("clients", [])
         ids = [c.get("id") for c in clients if c.get("id")]
         own = self._read(container, f"{XRAY_DIR}/xray_uuid.key").strip()
         extra = {own: {"name_hint": "основной конфиг"}} if own else {}
@@ -421,6 +475,36 @@ class ContainerManager:
         except SSHError as exc:
             return fail(str(exc))
         return fail(f"Протокол {protocol} не поддерживает клиентов")
+
+    def _apply_xray_config(self, container: str, config: dict, backup: str) -> None:
+        """Validate, atomically install, restart, verify; restore on any failure."""
+        serialized = json.dumps(config, indent=4, ensure_ascii=False) + "\n"
+        temp = XRAY_SERVER_CONFIG + ".new.json"
+        self._write(container, temp, serialized)
+        # Resolve the binary inside the same container; installations differ by image.
+        test = ("bin=$(command -v xray 2>/dev/null || find /usr/local/bin /usr/bin /opt -type f -name xray 2>/dev/null | head -1); "
+                "[ -n \"$bin\" ] || { echo 'xray binary not found' >&2; exit 127; }; "
+                f"$bin run -test -format json -c {shlex.quote(temp)}")
+        code, out, err = self._exec(container, f"sh -c {shlex.quote(test)}", timeout=self.install_timeout)
+        if code != 0:
+            raise SSHError(err.strip() or out.strip() or "Проверка конфигурации XRay не пройдена")
+        self._write(container, XRAY_SERVER_CONFIG + ".bak", backup)
+        try:
+            mv = f"mv {shlex.quote(temp)} {shlex.quote(XRAY_SERVER_CONFIG)}"
+            code, out, err = self._exec(container, f"sh -c {shlex.quote(mv)}")
+            if code != 0:
+                raise SSHError(err.strip() or out.strip() or "Не удалось установить конфиг XRay")
+            code, out, err = self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+            if code != 0 or not self._xray_process_running(container):
+                raise SSHError(err.strip() or out.strip() or "XRay не запустился после обновления")
+        except SSHError:
+            self._write(container, XRAY_SERVER_CONFIG, backup)
+            self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+            raise
+
+    def _xray_process_running(self, container: str) -> bool:
+        code, out, _ = self._exec(container, "sh -c 'pgrep -x xray >/dev/null || pidof xray >/dev/null'")
+        return code == 0
 
     def _gen_wg_keys(self, container: str) -> tuple[str, str]:
         prof = WG_PROFILES[container]
@@ -489,15 +573,71 @@ class ContainerManager:
 
         # 3. Регистрируем в clientsTable — так клиента увидит и приложение AmneziaVPN
         self._table_add(container, pub, client_name)
+        # Приватный ключ нужен, чтобы позже собрать ссылку и QR из списка клиентов.
+        self._save_wg_secret(container, pub, priv)
 
-        # 4. Собираем клиентский конфиг (server_scripts/awg/template.conf)
+        config_text = self._compose_wg_config(
+            container, interface, priv, f"{client_ip}/32", server_pub, psk,
+        )
+        return {
+            "ok": True, "client": client_name, "config": config_text,
+            "filename": f"{self._safe_filename(client_name)}.conf", "error": None,
+        }
+
+    def _wg_secrets_path(self, container: str) -> str:
+        return f"{WG_PROFILES[container]['dir']}/panel_client_secrets.json"
+
+    def _load_wg_secrets(self, container: str) -> dict[str, str]:
+        raw = self._read(container, self._wg_secrets_path(container)).strip()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(key): str(value) for key, value in data.items() if key and value}
+
+    def _save_wg_secret(self, container: str, public_key: str, private_key: str) -> None:
+        stored = self._load_wg_secrets(container)
+        stored[public_key] = private_key
+        self._write(
+            container,
+            self._wg_secrets_path(container),
+            json.dumps(stored, indent=2) + "\n",
+        )
+
+    def _drop_wg_secret(self, container: str, public_key: str) -> None:
+        stored = self._load_wg_secrets(container)
+        if public_key not in stored:
+            return
+        del stored[public_key]
+        self._write(
+            container,
+            self._wg_secrets_path(container),
+            json.dumps(stored, indent=2) + "\n",
+        )
+
+    def _compose_wg_config(
+        self,
+        container: str,
+        interface: dict,
+        private_key: str,
+        client_address: str,
+        server_public: str,
+        psk: str,
+    ) -> str:
+        prof = WG_PROFILES[container]
+        if "/" not in client_address:
+            client_address = f"{client_address}/32"
         port = interface.get("ListenPort") or "51820"
         dns1, dns2 = self._dns()
         lines = [
             "[Interface]",
-            f"Address = {client_ip}/32",
+            f"Address = {client_address}",
             f"DNS = {dns1}, {dns2}",
-            f"PrivateKey = {priv}",
+            f"PrivateKey = {private_key}",
         ]
         is_awg3 = False
         if prof["awg"]:
@@ -511,7 +651,7 @@ class ContainerManager:
         lines += [
             "",
             "[Peer]",
-            f"PublicKey = {server_pub}",
+            f"PublicKey = {server_public}",
         ]
         if psk:
             lines.append(f"PresharedKey = {psk}")
@@ -521,14 +661,42 @@ class ContainerManager:
             f"PersistentKeepalive = {'25-35' if is_awg3 else '25'}",
             "",
         ]
-        return {
-            "ok": True, "client": client_name, "config": "\n".join(lines),
-            "filename": f"{self._safe_filename(client_name)}.conf", "error": None,
-        }
+        return "\n".join(lines)
+
+    def _wg_client_config(self, container: str, client_id: str) -> str:
+        prof = WG_PROFILES[container]
+        conf = self._read(container, prof["conf"])
+        if not conf.strip():
+            raise SSHError(f"Не найден конфиг сервера {prof['conf']} в контейнере {container}")
+        interface, peers = _parse_wg_conf(conf)
+        peer = next((item for item in peers if item.get("PublicKey") == client_id), None)
+        if peer is None:
+            raise SSHError("Клиент не найден")
+        private_key = self._load_wg_secrets(container).get(client_id, "")
+        if not private_key:
+            raise SSHError(
+                "Приватный ключ этого клиента на сервере не сохранён. "
+                "Ссылка и QR доступны для клиентов, созданных в этой версии панели."
+            )
+        server_pub = self._read(container, f"{prof['dir']}/wireguard_server_public_key.key").strip()
+        if not server_pub and interface.get("PrivateKey"):
+            _, server_pub, _ = self._exec(
+                container, f"{prof['bin']} pubkey",
+                input_data=interface["PrivateKey"] + "\n",
+            )
+            server_pub = server_pub.strip()
+        if not server_pub:
+            raise SSHError("Не удалось получить публичный ключ сервера")
+        psk = (peer.get("PresharedKey") or "").strip() or \
+            self._read(container, f"{prof['dir']}/wireguard_psk.key").strip()
+        allowed = (peer.get("AllowedIPs") or "").split(",")[0].strip() or "10.8.1.1/32"
+        return self._compose_wg_config(
+            container, interface, private_key, allowed, server_pub, psk,
+        )
 
     @staticmethod
     def _safe_filename(name: str) -> str:
-        return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "client"
+        return re.sub(r"[^\w.\-]+", "_", name).strip("._") or "client"
 
     @staticmethod
     def _pem_only(text: str) -> str:
@@ -546,12 +714,24 @@ class ContainerManager:
         if code != 0:
             raise SSHError(err.strip() or out.strip() or "Не удалось выпустить сертификат")
 
+        self._table_add(container, client_id, client_name)
+        return {
+            "ok": True,
+            "client": client_name,
+            "config": self._openvpn_client_config(container, client_id),
+            "filename": f"{self._safe_filename(client_name)}.ovpn",
+            "error": None,
+        }
+
+    def _openvpn_client_config(self, container: str, client_id: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", client_id):
+            raise SSHError("Некорректный идентификатор клиента")
         ca = self._pem_only(self._read(container, f"{OPENVPN_DIR}/pki/ca.crt"))
         cert = self._pem_only(self._read(container, f"{OPENVPN_DIR}/pki/issued/{client_id}.crt"))
         key = self._pem_only(self._read(container, f"{OPENVPN_DIR}/pki/private/{client_id}.key"))
         ta = "\n".join(
-            l for l in self._read(container, f"{OPENVPN_DIR}/ta.key").splitlines()
-            if not l.strip().startswith("#")
+            line for line in self._read(container, f"{OPENVPN_DIR}/ta.key").splitlines()
+            if not line.strip().startswith("#")
         ).strip()
         if not (ca and cert and key):
             raise SSHError("Не удалось прочитать сертификаты клиента")
@@ -562,11 +742,11 @@ class ContainerManager:
             parts = line.strip().split(None, 1)
             if parts:
                 opts.setdefault(parts[0], parts[1] if len(parts) > 1 else "")
-        port_code, port_out, _ = self.ssh.run(
+        _port_code, port_out, _ = self.ssh.run(
             f"{self.docker} port {container} 2>/dev/null | head -n1", timeout=self.timeout
         )
-        m = re.search(r":(\d+)\s*$", port_out.strip())
-        port = m.group(1) if m else opts.get("port", "1194")
+        match = re.search(r":(\d+)\s*$", port_out.strip())
+        port = match.group(1) if match else opts.get("port", "1194")
         proto = opts.get("proto", "udp")
         dns1, dns2 = self._dns()
 
@@ -587,52 +767,88 @@ class ContainerManager:
         ]
         if ta and "tls-auth" in opts:
             cfg += ["<tls-auth>", ta, "</tls-auth>"]
-        self._table_add(container, client_id, client_name)
-        return {
-            "ok": True, "client": client_name, "config": "\n".join(cfg) + "\n",
-            "filename": f"{self._safe_filename(client_name)}.ovpn", "error": None,
-        }
+        return "\n".join(cfg) + "\n"
 
     def _add_xray_client(self, container: str, client_name: str) -> dict:
         config = self._xray_config(container)
-        inbounds = config.get("inbounds") or []
-        if not inbounds:
-            raise SSHError("В конфиге XRay нет inbounds")
-        inbound = inbounds[0]
-        stream = inbound.get("streamSettings", {})
-        security = stream.get("security", "none")
+        inbound = self._xray_inbound(config)
+        stream = inbound.get("streamSettings", {}) or {}
         network = stream.get("network", "tcp")
         clients = inbound.setdefault("settings", {}).setdefault("clients", [])
-        flow = next((c.get("flow") for c in clients if c.get("flow")), None)
-        if flow is None and security == "reality" and network in ("tcp", "raw"):
-            flow = "xtls-rprx-vision"
-
+        # Repair all legacy clients: vision flow is never valid for XHTTP/WS/gRPC.
+        if network not in ("tcp", "raw"):
+            for client in clients:
+                client.pop("flow", None)
         client_id = str(uuid_module.uuid4())
         entry = {"id": client_id}
-        if flow:
-            entry["flow"] = flow
+        if network in ("tcp", "raw"):
+            entry["flow"] = "xtls-rprx-vision"
         clients.append(entry)
-
-        self._write(container, XRAY_SERVER_CONFIG, json.dumps(config, indent=4))
-        self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+        backup = self._read(container, XRAY_SERVER_CONFIG)
+        self._apply_xray_config(container, config, backup)
         self._table_add(container, client_id, client_name)
-
-        reality = stream.get("realitySettings", {})
-        pbk = self._read(container, f"{XRAY_DIR}/xray_public.key").strip()
-        sid = self._read(container, f"{XRAY_DIR}/xray_short_id.key").strip() or \
-            (reality.get("shortIds") or [""])[0]
-        sni = (reality.get("serverNames") or [""])[0]
-        port = inbound.get("port", 443)
-
-        params = [f"type={network}", f"security={security}", "encryption=none"]
-        if flow:
-            params.append(f"flow={flow}")
-        if security == "reality":
-            params += [f"sni={sni}", "fp=chrome", f"pbk={pbk}", f"sid={sid}"]
-        link = f"vless://{client_id}@{self._server_host()}:{port}?{'&'.join(params)}#{quote(client_name)}"
         return {
-            "ok": True, "client": client_name, "config": link,
-            "filename": f"{self._safe_filename(client_name)}.txt", "error": None,
+            "ok": True,
+            "client": client_name,
+            "config": self._xray_link(container, inbound, client_id, client_name),
+            "filename": f"{self._safe_filename(client_name)}.txt",
+            "error": None,
+        }
+
+    def edit_client(self, container: str, client_id: str, client_name: str) -> dict:
+        """Изменяет отображаемое имя, не меняя протокольные ключи/идентификатор."""
+        if not self._validate_container(container) or not client_id:
+            return {"ok": False, "error": "Некорректные параметры клиента"}
+        if not self.validate_client_name(client_name):
+            return {"ok": False, "error": f"Имя клиента: от 1 до {CLIENT_NAME_MAX} символов"}
+        table = self._load_table(container)
+        found = False
+        for item in table:
+            if item.get("clientId") == client_id:
+                item.setdefault("userData", {})["clientName"] = client_name
+                found = True
+                break
+        if not found:
+            table.append({
+                "clientId": client_id,
+                "userData": {"clientName": client_name, "creationDate": _now_str()},
+            })
+        self._save_table(container, table)
+        return {"ok": True}
+
+    def client_config(self, container: str, client_id: str, client_name: str = "Client") -> dict:
+        """Ссылка или конфиг, которым клиент подключается. Его же кодирует QR."""
+        fail = lambda msg: {"ok": False, "config": "", "link": "", "error": msg}  # noqa: E731
+        if not self._validate_container(container) or not client_id:
+            return fail("Некорректные параметры клиента")
+        protocol = self.protocol_of(container)
+        try:
+            if not self.container_running(container):
+                return fail(f"Контейнер {container} не запущен")
+            if protocol == "wireguard":
+                link = self._wg_client_config(container, client_id)
+                filename = f"{self._safe_filename(client_name)}.conf"
+            elif protocol == "openvpn":
+                link = self._openvpn_client_config(container, client_id)
+                filename = f"{self._safe_filename(client_name)}.ovpn"
+            elif protocol == "xray":
+                config = self._xray_config(container)
+                inbound = self._xray_inbound(config)
+                clients = inbound.get("settings", {}).get("clients", [])
+                if not any(item.get("id") == client_id for item in clients):
+                    return fail("Клиент не найден")
+                link = self._xray_link(container, inbound, client_id, client_name)
+                filename = f"{self._safe_filename(client_name)}.txt"
+            else:
+                return fail("Протокол не поддерживает ссылку подключения")
+        except SSHError as exc:
+            return fail(str(exc))
+        return {
+            "ok": True,
+            "config": link,
+            "link": link,
+            "filename": filename,
+            "error": None,
         }
 
     # ------------------------------------------------------------------
@@ -680,6 +896,7 @@ class ContainerManager:
             if code != 0:
                 self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
         self._table_remove(container, client_id)
+        self._drop_wg_secret(container, client_id)
 
     def _delete_openvpn_client(self, container: str, client_id: str) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", client_id):
@@ -697,16 +914,13 @@ class ContainerManager:
 
     def _delete_xray_client(self, container: str, client_id: str) -> None:
         config = self._xray_config(container)
-        changed = False
-        for inbound in config.get("inbounds", []):
-            clients = inbound.get("settings", {}).get("clients", [])
-            new = [c for c in clients if c.get("id") != client_id]
-            if len(new) != len(clients):
-                inbound["settings"]["clients"] = new
-                changed = True
-        if changed:
-            self._write(container, XRAY_SERVER_CONFIG, json.dumps(config, indent=4))
-            self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+        inbound = self._xray_inbound(config)
+        clients = inbound.get("settings", {}).get("clients", [])
+        new = [c for c in clients if c.get("id") != client_id]
+        if len(new) != len(clients):
+            inbound["settings"]["clients"] = new
+            backup = self._read(container, XRAY_SERVER_CONFIG)
+            self._apply_xray_config(container, config, backup)
         self._table_remove(container, client_id)
 
     # ------------------------------------------------------------------
