@@ -6,10 +6,10 @@
 {% endblock %}
 
 {% block content %}
-<div class="card" style="max-width: 560px; margin: 0 auto;">
+<div class="card" style="max-width: 640px; margin: 0 auto;">
     <h1>Создать контейнер</h1>
     <p class="muted">
-        Выберите протокол и порт. Панель загрузит образ, запустит контейнер
+        Выберите протокол или службу. Панель загрузит образ, запустит контейнер
         и выполнит первичную настройку на сервере.
     </p>
 
@@ -17,15 +17,30 @@
         <div class="form-row">
             <label for="protocol">Протокол</label>
             <select id="protocol" name="protocol" required>
-                {% for key, meta in protocols.items() %}
-                <option value="{{ key }}"
-                        data-default-port="{{ meta.default_port }}"
-                        data-port-type="{{ meta.port_type }}"
-                        data-transport-choice="{{ 1 if meta.transport_choice else 0 }}"
-                        data-fixed-ports="{{ meta.fixed_ports }}">
-                    {{ meta.label }}{% if not meta.fixed_ports %} ({{ meta.port_type | upper }}){% endif %}
-                </option>
-                {% endfor %}
+                <optgroup label="VPN">
+                    {% for key, meta in protocols.items() if meta.group != 'service' %}
+                    <option value="{{ key }}"
+                            data-default-port="{{ meta.default_port }}"
+                            data-port-type="{{ meta.port_type }}"
+                            data-transport-choice="{{ 1 if meta.transport_choice else 0 }}"
+                            data-fixed-ports="{{ meta.fixed_ports }}"
+                            data-fields="{{ meta.create_fields | join(' ') }}">
+                        {{ meta.label }}{% if not meta.fixed_ports %} ({{ meta.port_type | upper }}){% endif %}
+                    </option>
+                    {% endfor %}
+                </optgroup>
+                <optgroup label="Службы">
+                    {% for key, meta in protocols.items() if meta.group == 'service' %}
+                    <option value="{{ key }}"
+                            data-default-port="{{ meta.default_port }}"
+                            data-port-type="{{ meta.port_type }}"
+                            data-transport-choice="0"
+                            data-fixed-ports="{{ meta.fixed_ports }}"
+                            data-fields="{{ meta.create_fields | join(' ') }}">
+                        {{ meta.label }}{% if not meta.fixed_ports %} ({{ meta.port_type | upper }}){% endif %}
+                    </option>
+                    {% endfor %}
+                </optgroup>
             </select>
         </div>
 
@@ -45,16 +60,56 @@
         </div>
         <p class="hint" id="fixed-ports" hidden></p>
 
+        <div class="form-row" data-for="username password" hidden>
+            <label for="username">Логин</label>
+            <input id="username" name="username" type="text" autocomplete="off"
+                   placeholder="пусто — значение по умолчанию">
+            <div class="hint">SFTP: sftp_user. SOCKS5: proxy_user. Пустой пароль будет сгенерирован.</div>
+        </div>
+        <div class="form-row" data-for="password" hidden>
+            <label for="password">Пароль</label>
+            <input id="password" name="password" type="text" autocomplete="off"
+                   placeholder="сгенерировать">
+        </div>
+        <div class="form-row" data-for="public_host" hidden>
+            <label for="public_host">Публичный хост</label>
+            <input id="public_host" name="public_host" type="text" autocomplete="off"
+                   placeholder="пусто — адрес SSH-сервера">
+        </div>
+        <div class="form-row" data-for="transport_mode" hidden>
+            <label for="transport_mode">Режим</label>
+            <select id="transport_mode" name="transport_mode">
+                <option value="standard">MTProto</option>
+                <option value="faketls">FakeTLS</option>
+            </select>
+        </div>
+        <div class="form-row" data-for="tls_domain" hidden>
+            <label for="tls_domain">Домен FakeTLS</label>
+            <input id="tls_domain" name="tls_domain" type="text" value="googletagmanager.com">
+        </div>
+        <div class="form-row" data-for="hostname" hidden>
+            <label for="hostname">Hostname</label>
+            <input id="hostname" name="hostname" type="text" data-required="1"
+                   placeholder="proxy.example.com" autocomplete="off">
+            <div class="hint">Нужна DNS-запись A на этот сервер. Порты по умолчанию 80 и 443.</div>
+        </div>
+        <div class="form-row" data-for="acme_email" hidden>
+            <label for="acme_email">Email ACME</label>
+            <input id="acme_email" name="acme_email" type="text" data-required="1"
+                   placeholder="admin@example.com" autocomplete="off">
+        </div>
+
         <button type="submit" class="btn btn-primary btn-block">
             Создать и запустить
         </button>
     </form>
 
     <p class="hint">
-        Контейнер собирается теми же скриптами, что и в приложении AmneziaVPN
-        (сборка образа занимает несколько минут), поэтому приложение тоже его увидит.
+        Контейнер собирается теми же скриптами, что и в приложении AmneziaVPN.
         XRay ставится как VLESS Reality. У IKEv2 порты всегда 500 и 4500.
-        Настройки соединения после установки меняются на странице контейнера.
+        Службы DNS, SFTP, SOCKS5, MTProxy, Telemt, TProxy и сайт в Tor
+        после установки открывают страницу настроек: там пароль и ссылка подключения.
+        Порт SFTP по умолчанию 222.
     </p>
 </div>
 {% endblock %}
@@ -71,6 +126,7 @@ function updateDefaults() {
     const portType = opt.dataset.portType;
     const transportChoice = opt.dataset.transportChoice === '1';
     const fixedPorts = opt.dataset.fixedPorts || '';
+    const fields = (opt.dataset.fields || '').split(' ').filter(Boolean);
     portInput.value = defPort;
     portHint.textContent = `По умолчанию: ${defPort} (${portType.toUpperCase()})`;
     document.getElementById('transport-row').hidden = !transportChoice;
@@ -79,6 +135,14 @@ function updateDefaults() {
     const fixed = document.getElementById('fixed-ports');
     fixed.hidden = !fixedPorts;
     fixed.textContent = fixedPorts ? `Порты фиксированы: ${fixedPorts}` : '';
+    document.querySelectorAll('[data-for]').forEach((row) => {
+        const keys = row.dataset.for.split(' ');
+        const visible = keys.some((key) => fields.includes(key));
+        row.hidden = !visible;
+        row.querySelectorAll('input, select, textarea').forEach((input) => {
+            if (input.dataset.required === '1') input.required = visible;
+        });
+    });
 }
 
 protocolSelect.addEventListener('change', updateDefaults);

@@ -131,7 +131,10 @@ textarea { min-height: 96px; resize: vertical; }
     color: var(--text);
 }
 .check-label input { width: auto; }
-input[readonly] { opacity: .7; }
+input[readonly] { opacity: .85; }
+.field-with-copy { display: flex; gap: 8px; align-items: center; }
+.field-with-copy input { flex: 1; min-width: 0; }
+.field-with-copy .btn { margin-top: 0; white-space: nowrap; }
 
 select {
     width: 100%;

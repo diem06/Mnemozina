@@ -13,7 +13,8 @@
     <p class="hint">{{ form.notice }}</p>
     {% endif %}
 
-    <form method="post" action="{{ url_for('connection_settings', container_name=container_name) }}" id="settings-form">
+    <form method="post" action="{{ url_for('connection_settings', container_name=container_name) }}" id="settings-form"
+          {% if form.readonly %}onsubmit="return false;"{% endif %}>
         {% for section in form.sections %}
         <fieldset class="settings-section"
                   {% if section.show_transport %}data-show-transport="{{ section.show_transport }}"{% endif %}>
@@ -42,19 +43,26 @@
                 <textarea id="field-{{ field.name }}" name="{{ field.name }}" rows="4">{{ field.value }}</textarea>
                 {% else %}
                 <label for="field-{{ field.name }}">{{ field.label }}</label>
-                <input id="field-{{ field.name }}" name="{{ field.name }}"
-                       type="{{ 'number' if field.type == 'number' else 'text' }}"
-                       value="{{ field.value }}"
-                       {% if field.readonly %}readonly{% endif %}
-                       {% if field.min is defined %}min="{{ field.min }}"{% endif %}
-                       {% if field.max is defined %}max="{{ field.max }}"{% endif %}>
+                <div class="{{ 'field-with-copy' if field.readonly else '' }}">
+                    <input id="field-{{ field.name }}" name="{{ field.name }}"
+                           type="{{ 'number' if field.type == 'number' else 'text' }}"
+                           value="{{ field.value }}"
+                           {% if field.readonly %}readonly{% endif %}
+                           {% if field.min is defined %}min="{{ field.min }}"{% endif %}
+                           {% if field.max is defined %}max="{{ field.max }}"{% endif %}>
+                    {% if field.readonly %}
+                    <button type="button" class="btn btn-ghost copy-field" data-copy="{{ field.name }}">Копировать</button>
+                    {% endif %}
+                </div>
                 {% endif %}
             </div>
             {% endfor %}
         </fieldset>
         {% endfor %}
 
+        {% if not form.readonly %}
         <button type="submit" class="btn btn-primary btn-block">Сохранить</button>
+        {% endif %}
     </form>
 </div>
 
@@ -86,5 +94,21 @@ function applyVisibility() {
 }
 document.getElementById('settings-form').addEventListener('change', applyVisibility);
 applyVisibility();
+document.querySelectorAll('.copy-field').forEach((button) => {
+    button.addEventListener('click', async () => {
+        const input = document.getElementById('field-' + button.dataset.copy);
+        const text = input ? input.value : '';
+        try {
+            await navigator.clipboard.writeText(text);
+        } catch (error) {
+            input.focus();
+            input.select();
+            document.execCommand('copy');
+        }
+        const previous = button.textContent;
+        button.textContent = 'Скопировано';
+        setTimeout(() => { button.textContent = previous; }, 1200);
+    });
+});
 </script>
 {% endblock %}

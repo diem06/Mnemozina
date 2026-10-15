@@ -354,9 +354,13 @@ def create_container():
             flash("Порт должен быть в диапазоне 1..65535", "error")
             return redirect(url_for("create_container"))
 
+    fields = {
+        key: request.form.get(key, "")
+        for key in meta.get("create_fields", [])
+    }
     manager = _manager(conn)
     try:
-        result = manager.create_container(protocol, port, transport)
+        result = manager.create_container(protocol, port, transport, fields)
     except SSHError as exc:
         flash(f"Ошибка соединения: {exc}", "error")
         _clear_connection()
@@ -364,6 +368,8 @@ def create_container():
 
     if result.get("ok"):
         flash(f"Контейнер {result['container']} создан и запущен", "ok")
+        if meta.get("group") == "service":
+            return redirect(url_for("connection_settings", container_name=result["container"]))
     else:
         flash(f"Ошибка: {result.get('error', 'неизвестная')}", "error")
 

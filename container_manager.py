@@ -42,6 +42,26 @@ from connection_settings import (
     wg_form_values,
     xray_form_values,
 )
+from service_settings import (
+    MTPROXY_DOMAIN,
+    SFTP_USER,
+    SOCKS_USER,
+    TELEMT_USER,
+    mtproxy_env,
+    mtproxy_values,
+    parse_sftp_cmd,
+    parse_socks,
+    random_password,
+    service_form,
+    socks_env,
+    telemt_env,
+    telemt_values,
+    tproxy_env,
+    tproxy_values,
+    validate_login,
+    validate_proxy_fields,
+    validate_tproxy,
+)
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_scripts")
 
@@ -91,6 +111,22 @@ AWG_DEFAULT_SPECIAL_JUNK_1 = (
 )
 
 CLIENT_NAME_MAX = 64
+SERVICE_KINDS = {"dns", "sftp", "socks5", "mtproxy", "telemt", "tproxy", "tor"}
+CLIENT_TABLE_PROTOCOLS = {"awg2", "wireguard", "openvpn", "xray"}
+
+
+def publish_flags(publishes: list[tuple]) -> str:
+    flags = []
+    for item in publishes:
+        if len(item) == 3:
+            host_port, container_port, proto = item
+            flags.append(f"-p {host_port}:{container_port}/{proto}")
+        elif len(item) == 2:
+            port, proto = item
+            flags.append(f"-p {port}:{port}/{proto}")
+        else:
+            raise ValueError("Проброс порта задаётся парой или тройкой")
+    return " ".join(flags)
 
 
 def _now_str() -> str:
@@ -920,17 +956,30 @@ class ContainerManager:
     # Создание контейнеров (как InstallController в amnezia-client)
     # ------------------------------------------------------------------
 
-    def create_container(self, protocol: str, port: int, transport: str = "udp") -> dict:
+    def create_container(
+        self,
+        protocol: str,
+        port: int,
+        transport: str = "udp",
+        fields: dict | None = None,
+    ) -> dict:
         specs = {
             "awg2": ("amnezia-awg2", "awg"),
             "wireguard": ("amnezia-wireguard", "wireguard"),
             "openvpn": ("amnezia-openvpn", "openvpn"),
             "xray": ("amnezia-xray", "xray"),
             "ipsec": ("amnezia-ipsec", "ipsec"),
+            "dns": ("amnezia-dns", "dns"),
+            "sftp": ("amnezia-sftp", "sftp"),
+            "socks5": ("amnezia-socks5proxy", "socks5_proxy"),
+            "mtproxy": ("amnezia-mtproxy", "mtproxy"),
+            "telemt": ("amnezia-telemt", "telemt"),
+            "tproxy": ("amnezia-tproxy", "tproxy"),
+            "tor": ("amnezia-torwebsite", "website_tor"),
         }
         if protocol not in specs:
             return {"ok": False, "error": f"Протокол '{protocol}' не поддерживается"}
-        if protocol != "ipsec" and not (1 <= port <= 65535):
+        if protocol not in ("ipsec", "dns", "tor", "tproxy") and not (1 <= port <= 65535):
             return {"ok": False, "error": "Некорректный порт"}
         transport = (transport or "udp").lower()
         if protocol == "openvpn" and transport not in ("udp", "tcp"):
@@ -939,19 +988,27 @@ class ContainerManager:
         if self.container_exists(name):
             return {"ok": False, "error": f"Контейнер {name} уже существует"}
 
-        variables = self._install_variables(protocol, name, port, transport)
         try:
+            variables = self._install_variables(protocol, name, port, transport, fields or {})
             self._install_from_scripts(name, script_dir, variables, port)
             if protocol == "xray":
                 self._write_initial_xray_config(name, port)
-            self._write(name, self._table_path(name), "[]")
+            if protocol in CLIENT_TABLE_PROTOCOLS:
+                self._write(name, self._table_path(name), "[]")
         except SSHError as exc:
             return {"ok": False, "error": str(exc)}
 
         time.sleep(2)
         return {"ok": True, "container": name, "protocol": protocol, "port": port}
 
-    def _install_variables(self, protocol: str, name: str, port: int, transport: str) -> dict:
+    def _install_variables(
+        self,
+        protocol: str,
+        name: str,
+        port: int,
+        transport: str,
+        fields: dict | None = None,
+    ) -> dict:
         subnet_ip, subnet_cidr = ("10.8.0.0", "24") if protocol == "openvpn" else ("10.8.1.0", "24")
         variables = {
             "$CONTAINER_NAME": name,
@@ -1017,7 +1074,71 @@ class ContainerManager:
                 "$SPECIAL_JUNK_2": "", "$SPECIAL_JUNK_3": "",
                 "$SPECIAL_JUNK_4": "", "$SPECIAL_JUNK_5": "",
             })
+        if protocol in ("dns", "sftp", "socks5", "mtproxy", "telemt", "tproxy", "tor"):
+            variables.update(self._service_variables(protocol, port, fields or {}))
         return variables
+
+    def _service_variables(self, protocol: str, port: int, fields: dict) -> dict:
+        if protocol == "sftp":
+            user = str(fields.get("username") or "").strip() or SFTP_USER
+            password = str(fields.get("password") or "").strip() or random_password()
+            user, password, errors = validate_login(user, password, allow_empty=False)
+            if errors:
+                raise SSHError("; ".join(errors))
+            return {"$SFTP_PORT": str(port), "$SFTP_USER": user, "$SFTP_PASSWORD": password}
+        if protocol == "socks5":
+            user = str(fields.get("username") or "").strip()
+            password = str(fields.get("password") or "").strip()
+            if not user and not password:
+                user, password = SOCKS_USER, random_password()
+            elif user and not password:
+                password = random_password()
+            user, password, errors = validate_login(user, password, allow_empty=False)
+            if errors:
+                raise SSHError("; ".join(errors))
+            return socks_env(port, user, password)
+        if protocol == "mtproxy":
+            cleaned, errors = validate_proxy_fields({
+                "port": str(port),
+                "transport_mode": fields.get("transport_mode") or "standard",
+                "tls_domain": fields.get("tls_domain") or MTPROXY_DOMAIN,
+                "public_host": fields.get("public_host") or "",
+                "tag": "",
+                "additional_secrets": "",
+                "workers_mode": "auto",
+                "workers": "2",
+            }, "mtproxy")
+            if errors:
+                raise SSHError("; ".join(errors))
+            return mtproxy_env(cleaned, "", regenerate=True)
+        if protocol == "telemt":
+            cleaned, errors = validate_proxy_fields({
+                "port": str(port),
+                "transport_mode": fields.get("transport_mode") or "standard",
+                "tls_domain": fields.get("tls_domain") or MTPROXY_DOMAIN,
+                "public_host": fields.get("public_host") or "",
+                "tag": "",
+                "additional_secrets": "",
+                "mask": "1",
+                "use_middle_proxy": "1",
+                "user_name": TELEMT_USER,
+            }, "telemt")
+            if errors:
+                raise SSHError("; ".join(errors))
+            return telemt_env(cleaned, "", regenerate=True)
+        if protocol == "tproxy":
+            cleaned, errors = validate_tproxy({
+                "hostname": fields.get("hostname") or "",
+                "acme_email": fields.get("acme_email") or "",
+                "carrier_mode": "https",
+                "workers": "1",
+                "http_port": "80",
+                "https_port": "443",
+            })
+            if errors:
+                raise SSHError("; ".join(errors))
+            return tproxy_env(cleaned, "", regenerate=True)
+        return {}
 
     def _install_from_scripts(self, name: str, script_dir: str, variables: dict, port: int) -> None:
         folder = variables["$DOCKERFILE_FOLDER"]
@@ -1063,6 +1184,8 @@ class ContainerManager:
 
     def _script_text(self, script_dir: str, filename: str) -> str:
         path = os.path.join(SCRIPTS_DIR, script_dir, filename)
+        if not os.path.isfile(path):
+            return ""
         with open(path, encoding="utf-8") as handle:
             return handle.read()
 
@@ -1093,7 +1216,7 @@ class ContainerManager:
             values = self._read_settings_values(container, kind)
         except SSHError as exc:
             return {"ok": False, "error": str(exc)}
-        form = settings_form(kind, values)
+        form = service_form(kind, values) if kind in SERVICE_KINDS else settings_form(kind, values)
         form.update({"ok": True, "protocol": kind, "container": container, "values": values})
         return form
 
@@ -1105,6 +1228,8 @@ class ContainerManager:
         kind = self._settings_kind(container)
         if kind is None:
             return {"ok": False, "error": "Для этого контейнера нет редактора настроек"}
+        if kind in ("dns", "tor"):
+            return {"ok": False, "error": "У этой службы нет изменяемых настроек"}
         try:
             if kind in ("awg", "wireguard"):
                 self._update_wg_settings(container, fields, awg=kind == "awg")
@@ -1114,6 +1239,16 @@ class ContainerManager:
                 self._update_xray_settings(container, fields)
             elif kind == "ipsec":
                 self._update_ipsec_settings(container, fields)
+            elif kind == "sftp":
+                self._update_sftp_settings(container, fields)
+            elif kind == "socks5":
+                self._update_socks_settings(container, fields)
+            elif kind == "mtproxy":
+                self._update_mtproxy_settings(container, fields)
+            elif kind == "telemt":
+                self._update_telemt_settings(container, fields)
+            elif kind == "tproxy":
+                self._update_tproxy_settings(container, fields)
         except SSHError as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True}
@@ -1137,9 +1272,18 @@ class ContainerManager:
             "amnezia-openvpn": "openvpn",
             "amnezia-xray": "xray",
             "amnezia-ipsec": "ipsec",
+            "amnezia-dns": "dns",
+            "amnezia-sftp": "sftp",
+            "amnezia-socks5proxy": "socks5",
+            "amnezia-mtproxy": "mtproxy",
+            "amnezia-telemt": "telemt",
+            "amnezia-tproxy": "tproxy",
+            "amnezia-torwebsite": "tor",
         }.get(container)
 
     def _read_settings_values(self, container: str, kind: str) -> dict:
+        if kind in SERVICE_KINDS:
+            return self._read_service_values(container, kind)
         if kind in ("awg", "wireguard"):
             prof = WG_PROFILES[container]
             conf = self._read(container, prof["conf"])
@@ -1162,6 +1306,207 @@ class ContainerManager:
         if not ipsec_conf.strip() and not ppp.strip():
             raise SSHError("Не найден конфиг IPsec")
         return ipsec_form_values(ipsec_conf, ppp)
+
+    def _read_service_values(self, container: str, kind: str) -> dict:
+        host = self.ssh.host
+        if kind == "dns":
+            return {}
+        if kind == "tor":
+            return {"hostname": self._read(container, "/var/lib/tor/hidden_service/hostname").strip()}
+        if kind == "sftp":
+            user, password = parse_sftp_cmd(self._inspect_cmd(container))
+            return {
+                "host": host,
+                "port": self._host_port_for(container, "22") or "222",
+                "username": user,
+                "password": password,
+            }
+        if kind == "socks5":
+            values = parse_socks(self._read(container, "/usr/local/3proxy/conf/3proxy.cfg"))
+            published = self._host_port_for(container, values["port"])
+            if published:
+                values["port"] = published
+            return values
+        if kind == "mtproxy":
+            values = mtproxy_values(
+                self._read(container, "/data/mtproxy-meta"),
+                self._read(container, "/data/secret"),
+                host,
+            )
+            published = self._first_host_port(container)
+            if published:
+                values["port"] = published
+            return values
+        if kind == "telemt":
+            return telemt_values(
+                self._read(container, "/data/config.toml"),
+                self._read(container, "/data/secret"),
+                host,
+            )
+        return tproxy_values(
+            self._read(container, "/data/tproxy-meta"),
+            self._read(container, "/data/secret"),
+        )
+
+    def _inspect_cmd(self, container: str) -> str:
+        code, out, _ = self.ssh.run(
+            f"{self.docker} inspect -f '{{{{json .Config.Cmd}}}}' {container}",
+            timeout=self.timeout,
+        )
+        return out if code == 0 else ""
+
+    def _port_bindings(self, container: str) -> dict:
+        code, out, _ = self.ssh.run(
+            f"{self.docker} inspect -f '{{{{json .HostConfig.PortBindings}}}}' {container}",
+            timeout=self.timeout,
+        )
+        if code != 0 or not out.strip() or out.strip() == "null":
+            return {}
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _host_port_for(self, container: str, container_port: str, proto: str = "tcp") -> str:
+        entries = self._port_bindings(container).get(f"{container_port}/{proto}") or []
+        if isinstance(entries, list) and entries:
+            return str(entries[0].get("HostPort") or "")
+        return ""
+
+    def _first_host_port(self, container: str) -> str:
+        for entries in self._port_bindings(container).values():
+            if isinstance(entries, list) and entries and entries[0].get("HostPort"):
+                return str(entries[0]["HostPort"])
+        return ""
+
+    @staticmethod
+    def _require_port(value, label: str = "Порт") -> str:
+        text = str(value or "").strip()
+        if not text.isdigit() or not 1 <= int(text) <= 65535:
+            raise SSHError(f"{label} должен быть числом от 1 до 65535")
+        return str(int(text))
+
+    def _reconfigure(self, container: str, script_dir: str, variables: dict) -> None:
+        script = self._subst(self._script_text(script_dir, "configure_container.sh"), variables)
+        if not script.strip():
+            return
+        code, out, err = self._script(container, script, timeout=self.install_timeout)
+        if code != 0:
+            raise SSHError(err.strip() or out.strip() or "configure_container.sh завершился с ошибкой")
+
+    def _restart(self, container: str) -> None:
+        self._host(f"{self.docker} restart {container}", timeout=self.install_timeout)
+
+    def _update_sftp_settings(self, container: str, fields: dict) -> None:
+        user, password, errors = validate_login(fields.get("username"), fields.get("password"), False)
+        if errors:
+            raise SSHError("; ".join(errors))
+        port = self._require_port(fields.get("port"))
+        current_user, current_password = parse_sftp_cmd(self._inspect_cmd(container))
+        current_port = self._host_port_for(container, "22") or port
+        if (user, password, port) == (current_user, current_password, current_port):
+            return
+        self._recreate_published(
+            container,
+            [(port, "22", "tcp")],
+            "--log-driver none --restart always",
+            backup=False,
+            command=f"{user}:{password}:::upload",
+        )
+
+    def _update_socks_settings(self, container: str, fields: dict) -> None:
+        user, password, errors = validate_login(fields.get("username"), fields.get("password"), True)
+        if errors:
+            raise SSHError("; ".join(errors))
+        port = self._require_port(fields.get("port"))
+        current = parse_socks(self._read(container, "/usr/local/3proxy/conf/3proxy.cfg"))
+        published = self._host_port_for(container, current["port"] or port) or current["port"]
+        if port != published:
+            self._recreate_published(
+                container,
+                [(port, "tcp")],
+                "--restart always",
+                backup=False,
+            )
+        variables = {
+            "$CONTAINER_NAME": container,
+            "$SERVER_IP_ADDRESS": self.ssh.host,
+            **socks_env(port, user, password),
+        }
+        self._reconfigure(container, "socks5_proxy", variables)
+        self._rewrite_start(container, variables)
+        self._restart(container)
+
+    def _proxy_base(self, container: str, extra: dict) -> dict:
+        return {
+            "$CONTAINER_NAME": container,
+            "$SERVER_IP_ADDRESS": self.ssh.host,
+            **extra,
+        }
+
+    def _update_mtproxy_settings(self, container: str, fields: dict) -> None:
+        cleaned, errors = validate_proxy_fields(fields, "mtproxy")
+        if errors:
+            raise SSHError("; ".join(errors))
+        secret = self._read(container, "/data/secret").strip()
+        variables = self._proxy_base(container, mtproxy_env(cleaned, secret, regenerate=False))
+        current_port = self._first_host_port(container)
+        if current_port and cleaned["port"] != current_port:
+            self._recreate_published(
+                container,
+                [(cleaned["port"], "tcp")],
+                "--log-driver none --restart always -v amnezia-mtproxy-data:/data",
+                backup=False,
+            )
+        self._reconfigure(container, "mtproxy", variables)
+        self._rewrite_start(container, variables)
+        self._restart(container)
+
+    def _update_telemt_settings(self, container: str, fields: dict) -> None:
+        cleaned, errors = validate_proxy_fields(fields, "telemt")
+        if errors:
+            raise SSHError("; ".join(errors))
+        secret = self._read(container, "/data/secret").strip()
+        variables = self._proxy_base(container, telemt_env(cleaned, secret, regenerate=False))
+        current_port = self._first_host_port(container)
+        if current_port and cleaned["port"] != current_port:
+            self._recreate_published(
+                container,
+                [(cleaned["port"], "tcp")],
+                "--log-driver none --restart always --ulimit nofile=65536:65536 "
+                "-v amnezia-telemt-data:/data",
+                backup=False,
+            )
+        self._reconfigure(container, "telemt", variables)
+        self._rewrite_start(container, variables)
+        self._restart(container)
+
+    def _update_tproxy_settings(self, container: str, fields: dict) -> None:
+        cleaned, errors = validate_tproxy(fields)
+        if errors:
+            raise SSHError("; ".join(errors))
+        secret = self._read(container, "/data/secret").strip()
+        current = tproxy_values(self._read(container, "/data/tproxy-meta"), secret)
+        variables = self._proxy_base(container, tproxy_env(cleaned, secret, regenerate=False))
+        http_pub = self._host_port_for(container, "80")
+        https_pub = self._host_port_for(container, "443")
+        ports_changed = (
+            cleaned["http_port"] != str(current.get("http_port") or "")
+            or cleaned["https_port"] != str(current.get("https_port") or "")
+            or (bool(http_pub) and http_pub != cleaned["http_port"])
+            or (bool(https_pub) and https_pub != cleaned["https_port"])
+        )
+        if ports_changed:
+            self._recreate_published(
+                container,
+                [(cleaned["http_port"], "80", "tcp"), (cleaned["https_port"], "443", "tcp")],
+                "--log-driver none --restart always -v amnezia-tproxy-data:/data",
+                backup=False,
+            )
+        self._reconfigure(container, "tproxy", variables)
+        self._rewrite_start(container, variables)
+        self._restart(container)
 
     def _update_wg_settings(self, container: str, fields: dict, awg: bool) -> None:
         prof = WG_PROFILES[container]
@@ -1282,8 +1627,20 @@ class ContainerManager:
     def _openvpn_run_args(self) -> str:
         return "--privileged --log-driver none --restart always --cap-add=NET_ADMIN"
 
-    def _recreate_published(self, container: str, publishes: list[tuple[str, str]], run_args: str) -> None:
-        """Пересоздаёт контейнер с новыми проброшенными портами, сохраняя /opt/amnezia."""
+    def _recreate_published(
+        self,
+        container: str,
+        publishes: list[tuple],
+        run_args: str,
+        *,
+        backup: bool = True,
+        command: str = "",
+    ) -> None:
+        """Пересоздаёт контейнер с новыми проброшенными портами.
+
+        VPN-контейнеры сохраняют /opt/amnezia. У служб без tar и без этого
+        каталога архив не нужен: данные MTProxy, Telemt и TProxy лежат в томе.
+        """
         code, image, err = self.ssh.run(
             f"{self.docker} inspect -f '{{{{.Config.Image}}}}' {container}",
             timeout=self.timeout,
@@ -1291,25 +1648,29 @@ class ContainerManager:
         image = image.strip()
         if code != 0 or not image:
             raise SSHError(err.strip() or "Не удалось узнать образ контейнера")
-        code, archive, err = self.ssh.run(
-            f"{self.docker} exec {container} tar -C / -czf - opt/amnezia | base64 -w 0",
-            timeout=self.install_timeout,
-        )
-        if code != 0 or not archive.strip():
-            raise SSHError(err.strip() or "Не удалось сохранить файлы контейнера перед сменой порта")
+        archive = ""
+        if backup:
+            code, archive, err = self.ssh.run(
+                f"{self.docker} exec {container} tar -C / -czf - opt/amnezia | base64 -w 0",
+                timeout=self.install_timeout,
+            )
+            if code != 0 or not archive.strip():
+                raise SSHError(err.strip() or "Не удалось сохранить файлы контейнера перед сменой порта")
         parked = f"{container}-replacing"
         self._host(f"{self.docker} rename {container} {parked}")
-        publish = " ".join(f"-p {port}:{port}/{proto}" for port, proto in publishes)
+        publish = publish_flags(publishes)
+        suffix = f" {shlex.quote(command)}" if command else ""
         try:
             self._host(
-                f"{self.docker} run -d {run_args} {publish} --name {container} {image}",
+                f"{self.docker} run -d {run_args} {publish} --name {container} {image}{suffix}",
                 timeout=self.install_timeout,
             )
-            self._host(
-                f"base64 -d | {self.docker} exec -i {container} tar -C / -xzf -",
-                timeout=self.install_timeout,
-                input_data=archive.strip(),
-            )
+            if archive.strip():
+                self._host(
+                    f"base64 -d | {self.docker} exec -i {container} tar -C / -xzf -",
+                    timeout=self.install_timeout,
+                    input_data=archive.strip(),
+                )
             self.ssh.run(
                 f"{self.docker} network connect amnezia-dns-net {container} >/dev/null 2>&1 || true",
                 timeout=self.timeout,
@@ -1327,6 +1688,10 @@ class ContainerManager:
             "amnezia-wireguard": "wireguard/start.sh",
             "amnezia-openvpn": "openvpn/start.sh",
             "amnezia-xray": "xray/start.sh",
+            "amnezia-socks5proxy": "socks5_proxy/start.sh",
+            "amnezia-mtproxy": "mtproxy/start.sh",
+            "amnezia-telemt": "telemt/start.sh",
+            "amnezia-tproxy": "tproxy/start.sh",
         }.get(container)
         if not script_name:
             return
