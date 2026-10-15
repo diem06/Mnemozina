@@ -45,19 +45,58 @@ class Config:
     # Протоколы, которые панель умеет СОЗДАВАТЬ в формате amnezia-client
     # (Dockerfile + configure/start-скрипты из client/server_scripts).
     # Такие контейнеры потом видит и приложение AmneziaVPN.
+    # Legacy AmneziaWG, Cloak и OpenVPN-over-Shadowsocks клиент больше не ставит.
     CREATABLE_PROTOCOLS = {
         "awg2": {
             "container": "amnezia-awg2",
             "label": "AmneziaWG (v3.1)",
             "default_port": 55424,
             "port_type": "udp",
+            "transport_choice": False,
+            "fixed_ports": "",
         },
         "wireguard": {
             "container": "amnezia-wireguard",
             "label": "WireGuard",
             "default_port": 51820,
             "port_type": "udp",
+            "transport_choice": False,
+            "fixed_ports": "",
         },
+        "xray": {
+            "container": "amnezia-xray",
+            "label": "XRay (VLESS Reality)",
+            "default_port": 443,
+            "port_type": "tcp",
+            "transport_choice": False,
+            "fixed_ports": "",
+        },
+        "openvpn": {
+            "container": "amnezia-openvpn",
+            "label": "OpenVPN",
+            "default_port": 1194,
+            "port_type": "udp",
+            "transport_choice": True,
+            "fixed_ports": "",
+        },
+        "ipsec": {
+            "container": "amnezia-ipsec",
+            "label": "IKEv2 / IPsec",
+            "default_port": 500,
+            "port_type": "udp",
+            "transport_choice": False,
+            "fixed_ports": "500/udp и 4500/udp",
+        },
+    }
+
+    # Контейнеры, у которых есть редактор настроек соединения.
+    SETTINGS_CONTAINERS = {
+        "amnezia-awg2",
+        "amnezia-awg",
+        "amnezia-wireguard",
+        "amnezia-openvpn",
+        "amnezia-xray",
+        "amnezia-ipsec",
     }
 
     # Контейнер → тип управления клиентами

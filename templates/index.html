@@ -44,6 +44,10 @@
                 <td><code>{{ c.id }}</code></td>
                 <td class="col-actions">
                     {% if c.exists %}
+                        {% if c.supports_settings and c.running %}
+                        <a href="{{ url_for('connection_settings', container_name=c.name) }}"
+                           class="btn btn-ghost">Настройки</a>
+                        {% endif %}
                         {% if c.supports_clients and c.running %}
                         <a href="{{ url_for('list_clients', container_name=c.name) }}"
                            class="btn btn-primary">Клиенты</a>

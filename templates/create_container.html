@@ -20,19 +20,30 @@
                 {% for key, meta in protocols.items() %}
                 <option value="{{ key }}"
                         data-default-port="{{ meta.default_port }}"
-                        data-port-type="{{ meta.port_type }}">
-                    {{ meta.label }} ({{ meta.port_type | upper }})
+                        data-port-type="{{ meta.port_type }}"
+                        data-transport-choice="{{ 1 if meta.transport_choice else 0 }}"
+                        data-fixed-ports="{{ meta.fixed_ports }}">
+                    {{ meta.label }}{% if not meta.fixed_ports %} ({{ meta.port_type | upper }}){% endif %}
                 </option>
                 {% endfor %}
             </select>
         </div>
 
-        <div class="form-row">
+        <div class="form-row" id="transport-row" hidden>
+            <label for="transport">Сетевой протокол</label>
+            <select id="transport" name="transport">
+                <option value="udp">UDP</option>
+                <option value="tcp">TCP</option>
+            </select>
+        </div>
+
+        <div class="form-row" id="port-row">
             <label for="port">Порт</label>
             <input id="port" name="port" type="number" min="1" max="65535"
                    value="55424" required>
             <div class="hint" id="port-hint">По умолчанию: 55424 (UDP)</div>
         </div>
+        <p class="hint" id="fixed-ports" hidden></p>
 
         <button type="submit" class="btn btn-primary btn-block">
             Создать и запустить
@@ -41,9 +52,9 @@
 
     <p class="hint">
         Контейнер собирается теми же скриптами, что и в приложении AmneziaVPN
-        (сборка образа занимает 1–5 минут), поэтому приложение тоже его увидит.<br>
-        OpenVPN и XRay устанавливайте через приложение AmneziaVPN — панель
-        умеет управлять их клиентами.
+        (сборка образа занимает несколько минут), поэтому приложение тоже его увидит.
+        XRay ставится как VLESS Reality. У IKEv2 порты всегда 500 и 4500.
+        Настройки соединения после установки меняются на странице контейнера.
     </p>
 </div>
 {% endblock %}
@@ -58,8 +69,16 @@ function updateDefaults() {
     const opt = protocolSelect.options[protocolSelect.selectedIndex];
     const defPort = opt.dataset.defaultPort;
     const portType = opt.dataset.portType;
+    const transportChoice = opt.dataset.transportChoice === '1';
+    const fixedPorts = opt.dataset.fixedPorts || '';
     portInput.value = defPort;
     portHint.textContent = `По умолчанию: ${defPort} (${portType.toUpperCase()})`;
+    document.getElementById('transport-row').hidden = !transportChoice;
+    document.getElementById('port-row').hidden = Boolean(fixedPorts);
+    portInput.required = !fixedPorts;
+    const fixed = document.getElementById('fixed-ports');
+    fixed.hidden = !fixedPorts;
+    fixed.textContent = fixedPorts ? `Порты фиксированы: ${fixedPorts}` : '';
 }
 
 protocolSelect.addEventListener('change', updateDefaults);
