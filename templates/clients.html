@@ -26,6 +26,7 @@
     {% endif %}
 
     {% if clients %}
+    <div class="table-wrap">
     <table class="container-table">
         <thead>
             <tr>
@@ -52,20 +53,58 @@
                 <td>{% if c.download or c.upload %}{{ c.download or "0" }} / {{ c.upload or "0" }}{% else %}—{% endif %}</td>
                 <td class="status-raw">{{ c.created or "—" }}</td>
                 <td class="col-actions">
-                    <form action="{{ url_for('delete_client', container_name=container_name) }}"
-                          method="post" class="inline-form"
-                          onsubmit="return confirm({{ ('Удалить клиента ' ~ c.name ~ '?') | tojson | forceescape }});">
-                        <input type="hidden" name="client_id" value="{{ c.id }}">
-                        <input type="hidden" name="client_name" value="{{ c.name }}">
-                        <button type="submit" class="btn btn-danger">Удалить</button>
-                    </form>
+                    <div class="client-actions">
+                        <button type="button" class="btn btn-ghost"
+                                data-client-id="{{ c.id }}"
+                                data-client-name="{{ c.name }}"
+                                onclick="showClientQr(this)">QR</button>
+                        <button type="button" class="btn btn-ghost"
+                                data-client-id="{{ c.id }}"
+                                data-client-name="{{ c.name }}"
+                                onclick="copyClientLink(this)">Ссылка</button>
+                        <form action="{{ url_for('delete_client', container_name=container_name) }}"
+                              method="post" class="inline-form"
+                              onsubmit="return confirm({{ ('Удалить клиента ' ~ c.name ~ '?') | tojson | forceescape }});">
+                            <input type="hidden" name="client_id" value="{{ c.id }}">
+                            <input type="hidden" name="client_name" value="{{ c.name }}">
+                            <button type="submit" class="btn btn-danger">Удалить</button>
+                        </form>
+                    </div>
                 </td>
             </tr>
         {% endfor %}
         </tbody>
     </table>
+    </div>
     {% else %}
     <p class="muted" style="margin-top: 16px;">Клиентов пока нет.</p>
     {% endif %}
 </div>
+
+<div id="share-modal" class="modal hidden">
+    <div class="modal-content share-modal">
+        <div class="modal-header">
+            <h2 id="share-title">Подключение</h2>
+            <button type="button" class="btn btn-ghost" onclick="closeShare()">Закрыть</button>
+        </div>
+        <div class="share-body">
+            <div id="share-qr"></div>
+            <p id="share-error" class="flash flash-error hidden"></p>
+            <textarea id="share-link" class="config-output" readonly rows="6"></textarea>
+            <div class="config-actions">
+                <button type="button" class="btn btn-primary" onclick="copyShareLink()">
+                    Копировать ссылку
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='qrcode.js') }}"></script>
+<script>
+const CLIENT_SHARE_URL = {{ url_for('client_share', container_name=container_name) | tojson }};
+</script>
+<script src="{{ url_for('static', filename='client-share.js') }}"></script>
 {% endblock %}

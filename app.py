@@ -132,6 +132,7 @@ def _container_info(conn: SSHSession) -> list[dict]:
             "running": bool(info) and info["status"].startswith("Up"),
             "exists": bool(info),
             "supports_clients": name in app.config["CLIENT_PROTOCOLS"],
+            "supports_settings": name in app.config["SETTINGS_CONTAINERS"],
         })
     # Несозданные — в конец, чтобы реальные контейнеры были сверху
     result.sort(key=lambda c: not c["exists"])
@@ -338,20 +339,28 @@ def create_container():
         return redirect(url_for("create_container"))
 
     meta = creatable[protocol]
-    port_raw = request.form.get("port", "").strip() or str(meta["default_port"])
-    try:
-        port = int(port_raw)
-    except ValueError:
-        flash("Некорректный порт", "error")
-        return redirect(url_for("create_container"))
+    transport = request.form.get("transport", "udp").strip().lower() or "udp"
+    if meta.get("fixed_ports"):
+        port = int(meta["default_port"])
+    else:
+        port_raw = request.form.get("port", "").strip() or str(meta["default_port"])
+        try:
+            port = int(port_raw)
+        except ValueError:
+            flash("Некорректный порт", "error")
+            return redirect(url_for("create_container"))
 
-    if not (1 <= port <= 65535):
-        flash("Порт должен быть в диапазоне 1..65535", "error")
-        return redirect(url_for("create_container"))
+        if not (1 <= port <= 65535):
+            flash("Порт должен быть в диапазоне 1..65535", "error")
+            return redirect(url_for("create_container"))
 
+    fields = {
+        key: request.form.get(key, "")
+        for key in meta.get("create_fields", [])
+    }
     manager = _manager(conn)
     try:
-        result = manager.create_container(protocol, port)
+        result = manager.create_container(protocol, port, transport, fields)
     except SSHError as exc:
         flash(f"Ошибка соединения: {exc}", "error")
         _clear_connection()
@@ -359,6 +368,8 @@ def create_container():
 
     if result.get("ok"):
         flash(f"Контейнер {result['container']} создан и запущен", "ok")
+        if meta.get("group") == "service":
+            return redirect(url_for("connection_settings", container_name=result["container"]))
     else:
         flash(f"Ошибка: {result.get('error', 'неизвестная')}", "error")
 
@@ -446,6 +457,30 @@ def add_client(container_name: str):
     )
 
 
+@app.route("/clients/<container_name>/share", methods=["POST"])
+def client_share(container_name: str):
+    conn = _require_connection()
+    if conn is None:
+        return jsonify({"ok": False, "error": "Нет соединения"}), 401
+
+    if not _is_allowed_container(container_name):
+        return jsonify({"ok": False, "error": "Контейнер не разрешён"}), 403
+
+    client_id = request.form.get("client_id", "").strip()
+    client_name = request.form.get("client_name", "").strip() or "Client"
+    if not client_id:
+        return jsonify({"ok": False, "error": "Не указан клиент"}), 400
+
+    manager = _manager(conn)
+    try:
+        result = manager.client_config(container_name, client_id, client_name)
+    except SSHError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+
 @app.route("/clients/<container_name>/delete", methods=["POST"])
 def delete_client(container_name: str):
     conn = _require_connection()
@@ -476,6 +511,82 @@ def delete_client(container_name: str):
         flash(f"Ошибка: {result.get('error')}", "error")
 
     return redirect(url_for("list_clients", container_name=container_name))
+
+
+# ---------------------------------------------------------------------------
+# Роуты: настройки соединения
+# ---------------------------------------------------------------------------
+
+@app.route("/settings/<container_name>", methods=["GET", "POST"])
+def connection_settings(container_name: str):
+    conn = _require_connection()
+    if conn is None:
+        flash("Необходимо подключиться к серверу", "error")
+        return redirect(url_for("login"))
+
+    if not _is_allowed_container(container_name) or container_name not in app.config["SETTINGS_CONTAINERS"]:
+        flash("Для этого контейнера нет редактора настроек", "error")
+        return redirect(url_for("index"))
+
+    manager = _manager(conn)
+    label = app.config["CONTAINER_LABELS"].get(container_name, container_name)
+
+    if request.method == "POST":
+        try:
+            result = manager.update_connection_settings(container_name, request.form)
+        except SSHError as exc:
+            flash(f"Ошибка соединения: {exc}", "error")
+            _clear_connection()
+            return redirect(url_for("login"))
+        if result.get("ok"):
+            flash(f"{label}: настройки соединения сохранены", "ok")
+            return redirect(url_for("connection_settings", container_name=container_name))
+        flash(result.get("error") or "Не удалось сохранить настройки", "error")
+
+    try:
+        form = manager.connection_settings(container_name)
+    except SSHError as exc:
+        flash(f"Ошибка соединения: {exc}", "error")
+        _clear_connection()
+        return redirect(url_for("login"))
+
+    if not form.get("ok"):
+        flash(form.get("error") or "Не удалось прочитать настройки", "error")
+        return redirect(url_for("index"))
+
+    return render_template(
+        "settings.html",
+        container_name=container_name,
+        container_label=label,
+        form=form,
+    )
+
+
+@app.route("/settings/<container_name>/remove", methods=["POST"])
+def remove_container(container_name: str):
+    conn = _require_connection()
+    if conn is None:
+        flash("Необходимо подключиться к серверу", "error")
+        return redirect(url_for("login"))
+
+    if not _is_allowed_container(container_name):
+        flash("Контейнер не в списке разрешённых", "error")
+        return redirect(url_for("index"))
+
+    manager = _manager(conn)
+    label = app.config["CONTAINER_LABELS"].get(container_name, container_name)
+    try:
+        result = manager.remove_container(container_name)
+    except SSHError as exc:
+        flash(f"Ошибка соединения: {exc}", "error")
+        _clear_connection()
+        return redirect(url_for("login"))
+
+    if result.get("ok"):
+        flash(f"{label} удалён с сервера", "ok")
+    else:
+        flash(result.get("error") or "Не удалось удалить контейнер", "error")
+    return redirect(url_for("index"))
 
 
 @app.errorhandler(404)

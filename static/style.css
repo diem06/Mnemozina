@@ -97,7 +97,7 @@ label {
     font-size: 13px;
     color: var(--muted);
 }
-input[type=text], input[type=password], input[type=number] {
+input[type=text], input[type=password], input[type=number], textarea {
     width: 100%;
     padding: 10px 12px;
     background: var(--bg-elev-2);
@@ -110,6 +110,31 @@ input[type=text], input[type=password], input[type=number] {
     transition: border-color .15s;
 }
 input:focus { border-color: var(--accent); }
+
+textarea { min-height: 96px; resize: vertical; }
+.settings-card { max-width: 720px; margin-left: auto; margin-right: auto; }
+.settings-section {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin: 18px 0;
+    padding: 8px 16px 4px;
+}
+.settings-section legend {
+    padding: 0 6px;
+    color: var(--muted);
+    font-size: 13px;
+}
+.check-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text);
+}
+.check-label input { width: auto; }
+input[readonly] { opacity: .85; }
+.field-with-copy { display: flex; gap: 8px; align-items: center; }
+.field-with-copy input { flex: 1; min-width: 0; }
+.field-with-copy .btn { margin-top: 0; white-space: nowrap; }
 
 select {
     width: 100%;
@@ -198,6 +223,15 @@ select:focus { border-color: var(--accent); }
 }
 .col-actions { text-align: right; white-space: nowrap; }
 .inline-form { display: inline-block; margin-left: 4px; }
+.table-wrap { overflow-x: auto; }
+.client-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.client-actions .inline-form { margin-left: 0; }
 
 /* Badges */
 .badge {
@@ -222,7 +256,7 @@ select:focus { border-color: var(--accent); }
     z-index: 100;
     padding: 24px;
 }
-.modal.hidden { display: none; }
+.hidden { display: none; }
 .modal-content {
     background: var(--bg-elev);
     border: 1px solid var(--border);
@@ -233,6 +267,22 @@ select:focus { border-color: var(--accent); }
     display: flex;
     flex-direction: column;
     overflow: hidden;
+}
+.share-modal { max-width: 460px; }
+.share-body { padding: 16px 18px 18px; overflow: auto; }
+.share-qr {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 12px;
+}
+.share-qr:empty { display: none; }
+.share-qr img {
+    width: 240px;
+    height: 240px;
+    background: #fff;
+    padding: 8px;
+    border-radius: 8px;
+    image-rendering: pixelated;
 }
 .modal-header {
     display: flex;

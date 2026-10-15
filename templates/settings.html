@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}Настройки — {{ container_label }}{% endblock %}
+
+{% block topbar_right %}
+    <a href="{{ url_for('index') }}" class="btn btn-ghost">← Назад</a>
+{% endblock %}
+
+{% block content %}
+<div class="card settings-card">
+    <h1>{{ container_label }}</h1>
+    <p class="muted">Настройки соединения <code>{{ container_name }}</code></p>
+    {% if form.notice %}
+    <p class="hint">{{ form.notice }}</p>
+    {% endif %}
+
+    <form method="post" action="{{ url_for('connection_settings', container_name=container_name) }}" id="settings-form"
+          {% if form.readonly %}onsubmit="return false;"{% endif %}>
+        {% for section in form.sections %}
+        <fieldset class="settings-section"
+                  {% if section.show_transport %}data-show-transport="{{ section.show_transport }}"{% endif %}>
+            <legend>{{ section.title }}</legend>
+            {% for field in section.fields %}
+            <div class="form-row"
+                 {% if field.show_transport %}data-show-transport="{{ field.show_transport }}"{% endif %}
+                 {% if field.show_security %}data-show-security="{{ field.show_security }}"{% endif %}>
+                {% if field.type == 'checkbox' %}
+                <label class="check-label">
+                    <input type="checkbox" name="{{ field.name }}" value="1"
+                           {% if field.value %}checked{% endif %}>
+                    {{ field.label }}
+                </label>
+                {% elif field.type == 'select' %}
+                <label for="field-{{ field.name }}">{{ field.label }}</label>
+                <select id="field-{{ field.name }}" name="{{ field.name }}">
+                    {% for option in field.options %}
+                    <option value="{{ option.value }}" {% if option.value == field.value %}selected{% endif %}>
+                        {{ option.label }}
+                    </option>
+                    {% endfor %}
+                </select>
+                {% elif field.type == 'textarea' %}
+                <label for="field-{{ field.name }}">{{ field.label }}</label>
+                <textarea id="field-{{ field.name }}" name="{{ field.name }}" rows="4">{{ field.value }}</textarea>
+                {% else %}
+                <label for="field-{{ field.name }}">{{ field.label }}</label>
+                <div class="{{ 'field-with-copy' if field.readonly else '' }}">
+                    <input id="field-{{ field.name }}" name="{{ field.name }}"
+                           type="{{ 'number' if field.type == 'number' else 'text' }}"
+                           value="{{ field.value }}"
+                           {% if field.readonly %}readonly{% endif %}
+                           {% if field.min is defined %}min="{{ field.min }}"{% endif %}
+                           {% if field.max is defined %}max="{{ field.max }}"{% endif %}>
+                    {% if field.readonly %}
+                    <button type="button" class="btn btn-ghost copy-field" data-copy="{{ field.name }}">Копировать</button>
+                    {% endif %}
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </fieldset>
+        {% endfor %}
+
+        {% if not form.readonly %}
+        <button type="submit" class="btn btn-primary btn-block">Сохранить</button>
+        {% endif %}
+    </form>
+</div>
+
+<div class="card settings-card">
+    <h2>Удаление</h2>
+    <p class="muted">Контейнер и его образ будут удалены с сервера. Клиенты больше не подключатся.</p>
+    <form method="post" action="{{ url_for('remove_container', container_name=container_name) }}"
+          onsubmit="return confirm('Удалить {{ container_label }} с сервера?');">
+        <button type="submit" class="btn btn-danger">Удалить контейнер</button>
+    </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function applyVisibility() {
+    const transport = document.getElementById('field-transport');
+    const security = document.getElementById('field-security');
+    const transportValue = transport ? transport.value : '';
+    const securityValue = security ? security.value : '';
+    document.querySelectorAll('[data-show-transport], [data-show-security]').forEach((node) => {
+        let visible = true;
+        const transports = node.dataset.showTransport;
+        const securities = node.dataset.showSecurity;
+        if (transports) visible = visible && transports.split(' ').includes(transportValue);
+        if (securities) visible = visible && securities.split(' ').includes(securityValue);
+        node.hidden = !visible;
+    });
+}
+document.getElementById('settings-form').addEventListener('change', applyVisibility);
+applyVisibility();
+document.querySelectorAll('.copy-field').forEach((button) => {
+    button.addEventListener('click', async () => {
+        const input = document.getElementById('field-' + button.dataset.copy);
+        const text = input ? input.value : '';
+        try {
+            await navigator.clipboard.writeText(text);
+        } catch (error) {
+            input.focus();
+            input.select();
+            document.execCommand('copy');
+        }
+        const previous = button.textContent;
+        button.textContent = 'Скопировано';
+        setTimeout(() => { button.textContent = previous; }, 1200);
+    });
+});
+</script>
+{% endblock %}

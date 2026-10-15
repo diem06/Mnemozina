@@ -26,9 +26,42 @@ import shlex
 import string
 import time
 import uuid as uuid_module
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from ssh_manager import SSHSession, SSHError
+from connection_settings import (
+    apply_ipsec_dns,
+    apply_wg_settings,
+    apply_xray_settings,
+    default_xray_server,
+    ipsec_form_values,
+    openvpn_form_values,
+    parse_wg_conf as _parse_wg_conf,
+    render_openvpn_conf,
+    settings_form,
+    wg_form_values,
+    xray_form_values,
+)
+from service_settings import (
+    MTPROXY_DOMAIN,
+    SFTP_USER,
+    SOCKS_USER,
+    TELEMT_USER,
+    mtproxy_env,
+    mtproxy_values,
+    parse_sftp_cmd,
+    parse_socks,
+    random_password,
+    service_form,
+    socks_env,
+    telemt_env,
+    telemt_values,
+    tproxy_env,
+    tproxy_values,
+    validate_login,
+    validate_proxy_fields,
+    validate_tproxy,
+)
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_scripts")
 
@@ -78,6 +111,22 @@ AWG_DEFAULT_SPECIAL_JUNK_1 = (
 )
 
 CLIENT_NAME_MAX = 64
+SERVICE_KINDS = {"dns", "sftp", "socks5", "mtproxy", "telemt", "tproxy", "tor"}
+CLIENT_TABLE_PROTOCOLS = {"awg2", "wireguard", "openvpn", "xray"}
+
+
+def publish_flags(publishes: list[tuple]) -> str:
+    flags = []
+    for item in publishes:
+        if len(item) == 3:
+            host_port, container_port, proto = item
+            flags.append(f"-p {host_port}:{container_port}/{proto}")
+        elif len(item) == 2:
+            port, proto = item
+            flags.append(f"-p {port}:{port}/{proto}")
+        else:
+            raise ValueError("Проброс порта задаётся парой или тройкой")
+    return " ".join(flags)
 
 
 def _now_str() -> str:
@@ -88,47 +137,6 @@ def _now_str() -> str:
 def _random_id(length: int = 32) -> str:
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-def _parse_wg_conf(conf: str) -> tuple[dict, list[dict]]:
-    """
-    Разбирает wg/awg-конфиг сервера.
-    Возвращает (interface: dict, peers: [dict]).
-    Закомментированные "# I1 = ..." в [Interface] тоже читаются (так их хранит
-    amnezia-client: I1–I5 нужны только клиенту).
-    """
-    interface: dict[str, str] = {}
-    peers: list[dict] = []
-    section = None
-    current: dict | None = None
-    for raw in conf.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1].strip().lower()
-            if section == "peer":
-                current = {}
-                peers.append(current)
-            continue
-        target = interface if section == "interface" else current
-        if target is None:
-            continue
-        commented = False
-        if line.startswith("#"):
-            line = line.lstrip("#").strip()
-            commented = True
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key, value = key.strip(), value.strip()
-        if commented:
-            # Нужны только закомментированные I1..I5
-            if section == "interface" and re.fullmatch(r"I[1-5]", key) and key not in interface:
-                interface[key] = value
-            continue
-        target[key] = value
-    return interface, peers
 
 
 class ContainerManager:
@@ -182,6 +190,16 @@ class ContainerManager:
     def _read(self, container: str, path: str) -> str:
         code, out, _ = self._exec(container, f"cat {shlex.quote(path)}")
         return out if code == 0 else ""
+
+    def _read_json(self, container: str, path: str) -> dict:
+        raw = self._read(container, path)
+        if not raw.strip():
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def _write(self, container: str, path: str, data: str, append: bool = False) -> None:
         op = ">>" if append else ">"
@@ -384,10 +402,64 @@ class ContainerManager:
         except json.JSONDecodeError as exc:
             raise SSHError(f"Не удалось разобрать {XRAY_SERVER_CONFIG}: {exc}") from exc
 
+    def _xray_inbound(self, config: dict) -> dict:
+        """Return the VLESS inbound, preferring Reality over unrelated inbounds."""
+        inbounds = config.get("inbounds") or []
+        candidates = [i for i in inbounds if i.get("protocol", "vless") == "vless"]
+        candidates = candidates or inbounds
+        reality = [i for i in candidates if i.get("streamSettings", {}).get("security") == "reality"]
+        if reality:
+            return reality[0]
+        if candidates:
+            return candidates[0]
+        raise SSHError("В конфиге XRay нет inbounds")
+
+    def _xray_link(self, container: str, inbound: dict, client_id: str,
+                   client_name: str = "Client") -> str:
+        """Build a VLESS link from the actual inbound stream settings."""
+        stream = inbound.get("streamSettings", {}) or {}
+        network = str(stream.get("network", "tcp"))
+        security = str(stream.get("security", "none"))
+        params = {"type": network, "security": security, "encryption": "none"}
+        # flow is valid only for TCP/RAW. Existing bad flow values are ignored.
+        client = next((c for c in inbound.get("settings", {}).get("clients", [])
+                       if c.get("id") == client_id), {})
+        if network in ("tcp", "raw") and client.get("flow"):
+            params["flow"] = client["flow"]
+        reality = stream.get("realitySettings", {}) or {}
+        if security == "reality":
+            pbk = self._read(container, f"{XRAY_DIR}/xray_public.key").strip()
+            sid = self._read(container, f"{XRAY_DIR}/xray_short_id.key").strip()
+            params.update({
+                "sni": (reality.get("serverNames") or [""])[0],
+                "fp": (reality.get("fingerprint") or "chrome"),
+                "pbk": pbk,
+                "sid": sid or (reality.get("shortIds") or [""])[0],
+            })
+        sock = stream.get("xhttpSettings", {}) or {}
+        if network == "xhttp":
+            params["path"] = sock.get("path") or "/"
+            params["mode"] = sock.get("mode") or "auto"
+            if sock.get("host"):
+                params["host"] = sock["host"]
+        elif network == "ws":
+            ws = stream.get("wsSettings", {}) or {}
+            params["path"] = ws.get("path") or "/"
+            headers = ws.get("headers", {}) or {}
+            if headers.get("Host") or headers.get("host"):
+                params["host"] = headers.get("Host") or headers.get("host")
+        elif network == "grpc":
+            grpc = stream.get("grpcSettings", {}) or {}
+            if grpc.get("serviceName"):
+                params["serviceName"] = grpc["serviceName"]
+        query = urlencode(params, quote_via=quote)
+        return (f"vless://{quote(str(client_id), safe='')}@{self._server_host()}"
+                f":{inbound.get('port', 443)}?{query}#{quote(client_name, safe='')}")
+
     def _list_xray_clients(self, container: str) -> list[dict]:
         config = self._xray_config(container)
-        inbounds = config.get("inbounds") or [{}]
-        clients = inbounds[0].get("settings", {}).get("clients", [])
+        inbound = self._xray_inbound(config)
+        clients = inbound.get("settings", {}).get("clients", [])
         ids = [c.get("id") for c in clients if c.get("id")]
         own = self._read(container, f"{XRAY_DIR}/xray_uuid.key").strip()
         extra = {own: {"name_hint": "основной конфиг"}} if own else {}
@@ -421,6 +493,36 @@ class ContainerManager:
         except SSHError as exc:
             return fail(str(exc))
         return fail(f"Протокол {protocol} не поддерживает клиентов")
+
+    def _apply_xray_config(self, container: str, config: dict, backup: str) -> None:
+        """Validate, atomically install, restart, verify; restore on any failure."""
+        serialized = json.dumps(config, indent=4, ensure_ascii=False) + "\n"
+        temp = XRAY_SERVER_CONFIG + ".new.json"
+        self._write(container, temp, serialized)
+        # Resolve the binary inside the same container; installations differ by image.
+        test = ("bin=$(command -v xray 2>/dev/null || find /usr/local/bin /usr/bin /opt -type f -name xray 2>/dev/null | head -1); "
+                "[ -n \"$bin\" ] || { echo 'xray binary not found' >&2; exit 127; }; "
+                f"$bin run -test -format json -c {shlex.quote(temp)}")
+        code, out, err = self._exec(container, f"sh -c {shlex.quote(test)}", timeout=self.install_timeout)
+        if code != 0:
+            raise SSHError(err.strip() or out.strip() or "Проверка конфигурации XRay не пройдена")
+        self._write(container, XRAY_SERVER_CONFIG + ".bak", backup)
+        try:
+            mv = f"mv {shlex.quote(temp)} {shlex.quote(XRAY_SERVER_CONFIG)}"
+            code, out, err = self._exec(container, f"sh -c {shlex.quote(mv)}")
+            if code != 0:
+                raise SSHError(err.strip() or out.strip() or "Не удалось установить конфиг XRay")
+            code, out, err = self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+            if code != 0 or not self._xray_process_running(container):
+                raise SSHError(err.strip() or out.strip() or "XRay не запустился после обновления")
+        except SSHError:
+            self._write(container, XRAY_SERVER_CONFIG, backup)
+            self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+            raise
+
+    def _xray_process_running(self, container: str) -> bool:
+        code, out, _ = self._exec(container, "sh -c 'pgrep -x xray >/dev/null || pidof xray >/dev/null'")
+        return code == 0
 
     def _gen_wg_keys(self, container: str) -> tuple[str, str]:
         prof = WG_PROFILES[container]
@@ -489,15 +591,71 @@ class ContainerManager:
 
         # 3. Регистрируем в clientsTable — так клиента увидит и приложение AmneziaVPN
         self._table_add(container, pub, client_name)
+        # Приватный ключ нужен, чтобы позже собрать ссылку и QR из списка клиентов.
+        self._save_wg_secret(container, pub, priv)
 
-        # 4. Собираем клиентский конфиг (server_scripts/awg/template.conf)
+        config_text = self._compose_wg_config(
+            container, interface, priv, f"{client_ip}/32", server_pub, psk,
+        )
+        return {
+            "ok": True, "client": client_name, "config": config_text,
+            "filename": f"{self._safe_filename(client_name)}.conf", "error": None,
+        }
+
+    def _wg_secrets_path(self, container: str) -> str:
+        return f"{WG_PROFILES[container]['dir']}/panel_client_secrets.json"
+
+    def _load_wg_secrets(self, container: str) -> dict[str, str]:
+        raw = self._read(container, self._wg_secrets_path(container)).strip()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(key): str(value) for key, value in data.items() if key and value}
+
+    def _save_wg_secret(self, container: str, public_key: str, private_key: str) -> None:
+        stored = self._load_wg_secrets(container)
+        stored[public_key] = private_key
+        self._write(
+            container,
+            self._wg_secrets_path(container),
+            json.dumps(stored, indent=2) + "\n",
+        )
+
+    def _drop_wg_secret(self, container: str, public_key: str) -> None:
+        stored = self._load_wg_secrets(container)
+        if public_key not in stored:
+            return
+        del stored[public_key]
+        self._write(
+            container,
+            self._wg_secrets_path(container),
+            json.dumps(stored, indent=2) + "\n",
+        )
+
+    def _compose_wg_config(
+        self,
+        container: str,
+        interface: dict,
+        private_key: str,
+        client_address: str,
+        server_public: str,
+        psk: str,
+    ) -> str:
+        prof = WG_PROFILES[container]
+        if "/" not in client_address:
+            client_address = f"{client_address}/32"
         port = interface.get("ListenPort") or "51820"
         dns1, dns2 = self._dns()
         lines = [
             "[Interface]",
-            f"Address = {client_ip}/32",
+            f"Address = {client_address}",
             f"DNS = {dns1}, {dns2}",
-            f"PrivateKey = {priv}",
+            f"PrivateKey = {private_key}",
         ]
         is_awg3 = False
         if prof["awg"]:
@@ -507,11 +665,13 @@ class ContainerManager:
                     lines.append(f"{key} = {value}")
             is_awg3 = any(interface.get(k) for k in AWG3_MARKERS) or \
                 interface.get("RandomTrailers") == "on" or interface.get("DisableCookies") == "on"
-        lines.append(f"MTU = {DEFAULT_MTU}")
+        opts = self._read_json(container, f"{prof['dir']}/panel_client_opts.json")
+        mtu = str(opts.get("mtu") or DEFAULT_MTU)
+        lines.append(f"MTU = {mtu}")
         lines += [
             "",
             "[Peer]",
-            f"PublicKey = {server_pub}",
+            f"PublicKey = {server_public}",
         ]
         if psk:
             lines.append(f"PresharedKey = {psk}")
@@ -521,14 +681,42 @@ class ContainerManager:
             f"PersistentKeepalive = {'25-35' if is_awg3 else '25'}",
             "",
         ]
-        return {
-            "ok": True, "client": client_name, "config": "\n".join(lines),
-            "filename": f"{self._safe_filename(client_name)}.conf", "error": None,
-        }
+        return "\n".join(lines)
+
+    def _wg_client_config(self, container: str, client_id: str) -> str:
+        prof = WG_PROFILES[container]
+        conf = self._read(container, prof["conf"])
+        if not conf.strip():
+            raise SSHError(f"Не найден конфиг сервера {prof['conf']} в контейнере {container}")
+        interface, peers = _parse_wg_conf(conf)
+        peer = next((item for item in peers if item.get("PublicKey") == client_id), None)
+        if peer is None:
+            raise SSHError("Клиент не найден")
+        private_key = self._load_wg_secrets(container).get(client_id, "")
+        if not private_key:
+            raise SSHError(
+                "Приватный ключ этого клиента на сервере не сохранён. "
+                "Ссылка и QR доступны для клиентов, созданных в этой версии панели."
+            )
+        server_pub = self._read(container, f"{prof['dir']}/wireguard_server_public_key.key").strip()
+        if not server_pub and interface.get("PrivateKey"):
+            _, server_pub, _ = self._exec(
+                container, f"{prof['bin']} pubkey",
+                input_data=interface["PrivateKey"] + "\n",
+            )
+            server_pub = server_pub.strip()
+        if not server_pub:
+            raise SSHError("Не удалось получить публичный ключ сервера")
+        psk = (peer.get("PresharedKey") or "").strip() or \
+            self._read(container, f"{prof['dir']}/wireguard_psk.key").strip()
+        allowed = (peer.get("AllowedIPs") or "").split(",")[0].strip() or "10.8.1.1/32"
+        return self._compose_wg_config(
+            container, interface, private_key, allowed, server_pub, psk,
+        )
 
     @staticmethod
     def _safe_filename(name: str) -> str:
-        return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "client"
+        return re.sub(r"[^\w.\-]+", "_", name).strip("._") or "client"
 
     @staticmethod
     def _pem_only(text: str) -> str:
@@ -546,12 +734,24 @@ class ContainerManager:
         if code != 0:
             raise SSHError(err.strip() or out.strip() or "Не удалось выпустить сертификат")
 
+        self._table_add(container, client_id, client_name)
+        return {
+            "ok": True,
+            "client": client_name,
+            "config": self._openvpn_client_config(container, client_id),
+            "filename": f"{self._safe_filename(client_name)}.ovpn",
+            "error": None,
+        }
+
+    def _openvpn_client_config(self, container: str, client_id: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", client_id):
+            raise SSHError("Некорректный идентификатор клиента")
         ca = self._pem_only(self._read(container, f"{OPENVPN_DIR}/pki/ca.crt"))
         cert = self._pem_only(self._read(container, f"{OPENVPN_DIR}/pki/issued/{client_id}.crt"))
         key = self._pem_only(self._read(container, f"{OPENVPN_DIR}/pki/private/{client_id}.key"))
         ta = "\n".join(
-            l for l in self._read(container, f"{OPENVPN_DIR}/ta.key").splitlines()
-            if not l.strip().startswith("#")
+            line for line in self._read(container, f"{OPENVPN_DIR}/ta.key").splitlines()
+            if not line.strip().startswith("#")
         ).strip()
         if not (ca and cert and key):
             raise SSHError("Не удалось прочитать сертификаты клиента")
@@ -562,14 +762,15 @@ class ContainerManager:
             parts = line.strip().split(None, 1)
             if parts:
                 opts.setdefault(parts[0], parts[1] if len(parts) > 1 else "")
-        port_code, port_out, _ = self.ssh.run(
+        _port_code, port_out, _ = self.ssh.run(
             f"{self.docker} port {container} 2>/dev/null | head -n1", timeout=self.timeout
         )
-        m = re.search(r":(\d+)\s*$", port_out.strip())
-        port = m.group(1) if m else opts.get("port", "1194")
+        match = re.search(r":(\d+)\s*$", port_out.strip())
+        port = match.group(1) if match else opts.get("port", "1194")
         proto = opts.get("proto", "udp")
         dns1, dns2 = self._dns()
 
+        client_opts = self._read_json(container, f"{OPENVPN_DIR}/panel_client_opts.json")
         cfg = [
             "client", "dev tun", f"proto {proto}", "resolv-retry infinite", "nobind",
             "persist-key", "persist-tun",
@@ -581,58 +782,102 @@ class ContainerManager:
             f"auth {opts.get('auth', 'SHA512')}",
             "verb 3", "tls-client", "tls-version-min 1.2", "key-direction 1",
             "remote-cert-tls server", "redirect-gateway def1 bypass-dhcp", "",
-            f"dhcp-option DNS {dns1}", f"dhcp-option DNS {dns2}", "block-outside-dns", "",
+            f"dhcp-option DNS {dns1}", f"dhcp-option DNS {dns2}",
+        ]
+        if client_opts.get("block_outside_dns", True):
+            cfg.append("block-outside-dns")
+        extra = str(client_opts.get("additional_client") or "").strip()
+        if extra:
+            cfg += ["", extra]
+        cfg += [
+            "",
             f"remote {self._server_host()} {port}", "",
             "<ca>", ca, "</ca>", "<cert>", cert, "</cert>", "<key>", key, "</key>",
         ]
         if ta and "tls-auth" in opts:
             cfg += ["<tls-auth>", ta, "</tls-auth>"]
-        self._table_add(container, client_id, client_name)
-        return {
-            "ok": True, "client": client_name, "config": "\n".join(cfg) + "\n",
-            "filename": f"{self._safe_filename(client_name)}.ovpn", "error": None,
-        }
+        return "\n".join(cfg) + "\n"
 
     def _add_xray_client(self, container: str, client_name: str) -> dict:
         config = self._xray_config(container)
-        inbounds = config.get("inbounds") or []
-        if not inbounds:
-            raise SSHError("В конфиге XRay нет inbounds")
-        inbound = inbounds[0]
-        stream = inbound.get("streamSettings", {})
-        security = stream.get("security", "none")
+        inbound = self._xray_inbound(config)
+        stream = inbound.get("streamSettings", {}) or {}
         network = stream.get("network", "tcp")
         clients = inbound.setdefault("settings", {}).setdefault("clients", [])
-        flow = next((c.get("flow") for c in clients if c.get("flow")), None)
-        if flow is None and security == "reality" and network in ("tcp", "raw"):
-            flow = "xtls-rprx-vision"
-
+        # Repair all legacy clients: vision flow is never valid for XHTTP/WS/gRPC.
+        if network not in ("tcp", "raw"):
+            for client in clients:
+                client.pop("flow", None)
         client_id = str(uuid_module.uuid4())
         entry = {"id": client_id}
-        if flow:
-            entry["flow"] = flow
+        if network in ("tcp", "raw"):
+            entry["flow"] = "xtls-rprx-vision"
         clients.append(entry)
-
-        self._write(container, XRAY_SERVER_CONFIG, json.dumps(config, indent=4))
-        self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+        backup = self._read(container, XRAY_SERVER_CONFIG)
+        self._apply_xray_config(container, config, backup)
         self._table_add(container, client_id, client_name)
-
-        reality = stream.get("realitySettings", {})
-        pbk = self._read(container, f"{XRAY_DIR}/xray_public.key").strip()
-        sid = self._read(container, f"{XRAY_DIR}/xray_short_id.key").strip() or \
-            (reality.get("shortIds") or [""])[0]
-        sni = (reality.get("serverNames") or [""])[0]
-        port = inbound.get("port", 443)
-
-        params = [f"type={network}", f"security={security}", "encryption=none"]
-        if flow:
-            params.append(f"flow={flow}")
-        if security == "reality":
-            params += [f"sni={sni}", "fp=chrome", f"pbk={pbk}", f"sid={sid}"]
-        link = f"vless://{client_id}@{self._server_host()}:{port}?{'&'.join(params)}#{quote(client_name)}"
         return {
-            "ok": True, "client": client_name, "config": link,
-            "filename": f"{self._safe_filename(client_name)}.txt", "error": None,
+            "ok": True,
+            "client": client_name,
+            "config": self._xray_link(container, inbound, client_id, client_name),
+            "filename": f"{self._safe_filename(client_name)}.txt",
+            "error": None,
+        }
+
+    def edit_client(self, container: str, client_id: str, client_name: str) -> dict:
+        """Изменяет отображаемое имя, не меняя протокольные ключи/идентификатор."""
+        if not self._validate_container(container) or not client_id:
+            return {"ok": False, "error": "Некорректные параметры клиента"}
+        if not self.validate_client_name(client_name):
+            return {"ok": False, "error": f"Имя клиента: от 1 до {CLIENT_NAME_MAX} символов"}
+        table = self._load_table(container)
+        found = False
+        for item in table:
+            if item.get("clientId") == client_id:
+                item.setdefault("userData", {})["clientName"] = client_name
+                found = True
+                break
+        if not found:
+            table.append({
+                "clientId": client_id,
+                "userData": {"clientName": client_name, "creationDate": _now_str()},
+            })
+        self._save_table(container, table)
+        return {"ok": True}
+
+    def client_config(self, container: str, client_id: str, client_name: str = "Client") -> dict:
+        """Ссылка или конфиг, которым клиент подключается. Его же кодирует QR."""
+        fail = lambda msg: {"ok": False, "config": "", "link": "", "error": msg}  # noqa: E731
+        if not self._validate_container(container) or not client_id:
+            return fail("Некорректные параметры клиента")
+        protocol = self.protocol_of(container)
+        try:
+            if not self.container_running(container):
+                return fail(f"Контейнер {container} не запущен")
+            if protocol == "wireguard":
+                link = self._wg_client_config(container, client_id)
+                filename = f"{self._safe_filename(client_name)}.conf"
+            elif protocol == "openvpn":
+                link = self._openvpn_client_config(container, client_id)
+                filename = f"{self._safe_filename(client_name)}.ovpn"
+            elif protocol == "xray":
+                config = self._xray_config(container)
+                inbound = self._xray_inbound(config)
+                clients = inbound.get("settings", {}).get("clients", [])
+                if not any(item.get("id") == client_id for item in clients):
+                    return fail("Клиент не найден")
+                link = self._xray_link(container, inbound, client_id, client_name)
+                filename = f"{self._safe_filename(client_name)}.txt"
+            else:
+                return fail("Протокол не поддерживает ссылку подключения")
+        except SSHError as exc:
+            return fail(str(exc))
+        return {
+            "ok": True,
+            "config": link,
+            "link": link,
+            "filename": filename,
+            "error": None,
         }
 
     # ------------------------------------------------------------------
@@ -680,6 +925,7 @@ class ContainerManager:
             if code != 0:
                 self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
         self._table_remove(container, client_id)
+        self._drop_wg_secret(container, client_id)
 
     def _delete_openvpn_client(self, container: str, client_id: str) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", client_id):
@@ -697,46 +943,112 @@ class ContainerManager:
 
     def _delete_xray_client(self, container: str, client_id: str) -> None:
         config = self._xray_config(container)
-        changed = False
-        for inbound in config.get("inbounds", []):
-            clients = inbound.get("settings", {}).get("clients", [])
-            new = [c for c in clients if c.get("id") != client_id]
-            if len(new) != len(clients):
-                inbound["settings"]["clients"] = new
-                changed = True
-        if changed:
-            self._write(container, XRAY_SERVER_CONFIG, json.dumps(config, indent=4))
-            self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+        inbound = self._xray_inbound(config)
+        clients = inbound.get("settings", {}).get("clients", [])
+        new = [c for c in clients if c.get("id") != client_id]
+        if len(new) != len(clients):
+            inbound["settings"]["clients"] = new
+            backup = self._read(container, XRAY_SERVER_CONFIG)
+            self._apply_xray_config(container, config, backup)
         self._table_remove(container, client_id)
 
     # ------------------------------------------------------------------
     # Создание контейнеров (как InstallController в amnezia-client)
     # ------------------------------------------------------------------
 
-    def create_container(self, protocol: str, port: int) -> dict:
-        if protocol not in ("awg2", "wireguard"):
+    def create_container(
+        self,
+        protocol: str,
+        port: int,
+        transport: str = "udp",
+        fields: dict | None = None,
+    ) -> dict:
+        specs = {
+            "awg2": ("amnezia-awg2", "awg"),
+            "wireguard": ("amnezia-wireguard", "wireguard"),
+            "openvpn": ("amnezia-openvpn", "openvpn"),
+            "xray": ("amnezia-xray", "xray"),
+            "ipsec": ("amnezia-ipsec", "ipsec"),
+            "dns": ("amnezia-dns", "dns"),
+            "sftp": ("amnezia-sftp", "sftp"),
+            "socks5": ("amnezia-socks5proxy", "socks5_proxy"),
+            "mtproxy": ("amnezia-mtproxy", "mtproxy"),
+            "telemt": ("amnezia-telemt", "telemt"),
+            "tproxy": ("amnezia-tproxy", "tproxy"),
+            "tor": ("amnezia-torwebsite", "website_tor"),
+        }
+        if protocol not in specs:
             return {"ok": False, "error": f"Протокол '{protocol}' не поддерживается"}
-        if not (1 <= port <= 65535):
+        if protocol not in ("ipsec", "dns", "tor", "tproxy") and not (1 <= port <= 65535):
             return {"ok": False, "error": "Некорректный порт"}
-        name = {"awg2": "amnezia-awg2", "wireguard": "amnezia-wireguard"}[protocol]
+        transport = (transport or "udp").lower()
+        if protocol == "openvpn" and transport not in ("udp", "tcp"):
+            return {"ok": False, "error": "Для OpenVPN выберите udp или tcp"}
+        name, script_dir = specs[protocol]
         if self.container_exists(name):
             return {"ok": False, "error": f"Контейнер {name} уже существует"}
 
-        scripts_dir = os.path.join(SCRIPTS_DIR, "awg" if protocol == "awg2" else "wireguard")
-        read = lambda f: open(os.path.join(scripts_dir, f), encoding="utf-8").read()  # noqa: E731
+        try:
+            variables = self._install_variables(protocol, name, port, transport, fields or {})
+            self._install_from_scripts(name, script_dir, variables, port)
+            if protocol == "xray":
+                self._write_initial_xray_config(name, port)
+            if protocol in CLIENT_TABLE_PROTOCOLS:
+                self._write(name, self._table_path(name), "[]")
+        except SSHError as exc:
+            return {"ok": False, "error": str(exc)}
 
-        subnet_ip, subnet_cidr = "10.8.1.0", "24"
+        time.sleep(2)
+        return {"ok": True, "container": name, "protocol": protocol, "port": port}
+
+    def _install_variables(
+        self,
+        protocol: str,
+        name: str,
+        port: int,
+        transport: str,
+        fields: dict | None = None,
+    ) -> dict:
+        subnet_ip, subnet_cidr = ("10.8.0.0", "24") if protocol == "openvpn" else ("10.8.1.0", "24")
         variables = {
             "$CONTAINER_NAME": name,
             "$DOCKERFILE_FOLDER": f"/opt/amnezia/{name}",
+            "$SERVER_IP_ADDRESS": self.ssh.host,
+            "$PRIMARY_DNS": self.primary_dns,
+            "$SECONDARY_DNS": self.secondary_dns,
+            "$PRIMARY_SERVER_DNS": self.primary_dns,
+            "$SECONDARY_SERVER_DNS": self.secondary_dns,
             "$WIREGUARD_SUBNET_IP": subnet_ip,
             "$WIREGUARD_SUBNET_CIDR": subnet_cidr,
             "$WIREGUARD_SERVER_PORT": str(port),
             "$AWG_SUBNET_IP": subnet_ip,
             "$AWG_SERVER_PORT": str(port),
+            "$OPENVPN_SUBNET_IP": "10.8.0.0",
+            "$OPENVPN_SUBNET_CIDR": "24",
+            "$OPENVPN_SUBNET_MASK": "255.255.255.0",
+            "$OPENVPN_PORT": str(port),
+            "$OPENVPN_TRANSPORT_PROTO": transport if protocol == "openvpn" else "udp",
+            "$OPENVPN_NCP_DISABLE": "",
+            "$OPENVPN_CIPHER": "AES-256-GCM",
+            "$OPENVPN_HASH": "SHA512",
+            "$OPENVPN_TLS_AUTH": "tls-auth /opt/amnezia/openvpn/ta.key 0",
+            "$OPENVPN_ADDITIONAL_CLIENT_CONFIG": "",
+            "$OPENVPN_ADDITIONAL_SERVER_CONFIG": "",
+            "$XRAY_SERVER_PORT": str(port),
+            "$XRAY_SITE_NAME": "www.googletagmanager.com",
+            "$IPSEC_VPN_L2TP_NET": "192.168.42.0/24",
+            "$IPSEC_VPN_L2TP_POOL": "192.168.42.10-192.168.42.250",
+            "$IPSEC_VPN_L2TP_LOCAL": "192.168.42.1",
+            "$IPSEC_VPN_XAUTH_NET": "192.168.43.0/24",
+            "$IPSEC_VPN_XAUTH_POOL": "192.168.43.10-192.168.43.250",
+            "$IPSEC_VPN_SHA2_TRUNCBUG": "yes",
+            "$IPSEC_VPN_VPN_ANDROID_MTU_FIX": "yes",
+            "$IPSEC_VPN_DISABLE_IKEV2": "no",
+            "$IPSEC_VPN_DISABLE_L2TP": "no",
+            "$IPSEC_VPN_DISABLE_XAUTH": "no",
+            "$IPSEC_VPN_C2C_TRAFFIC": "no",
         }
         if protocol == "awg2":
-            # Значения как в AwgInstaller::generateAwgParameters (версия 3.1)
             variables.update({
                 "$JUNK_PACKET_COUNT": str(secrets.choice(range(4, 7))),
                 "$JUNK_PACKET_MIN_SIZE": "10",
@@ -762,50 +1074,628 @@ class ContainerManager:
                 "$SPECIAL_JUNK_2": "", "$SPECIAL_JUNK_3": "",
                 "$SPECIAL_JUNK_4": "", "$SPECIAL_JUNK_5": "",
             })
+        if protocol in ("dns", "sftp", "socks5", "mtproxy", "telemt", "tproxy", "tor"):
+            variables.update(self._service_variables(protocol, port, fields or {}))
+        return variables
 
-        def subst(text: str) -> str:
-            # длинные имена первыми, чтобы $AWG_SUBNET_IP не съел $AWG_SUBNET_IP_X и т.п.
-            for key in sorted(variables, key=len, reverse=True):
-                text = text.replace(key, variables[key])
-            return text.replace("sudo docker", self.docker)
+    def _service_variables(self, protocol: str, port: int, fields: dict) -> dict:
+        if protocol == "sftp":
+            user = str(fields.get("username") or "").strip() or SFTP_USER
+            password = str(fields.get("password") or "").strip() or random_password()
+            user, password, errors = validate_login(user, password, allow_empty=False)
+            if errors:
+                raise SSHError("; ".join(errors))
+            return {"$SFTP_PORT": str(port), "$SFTP_USER": user, "$SFTP_PASSWORD": password}
+        if protocol == "socks5":
+            user = str(fields.get("username") or "").strip()
+            password = str(fields.get("password") or "").strip()
+            if not user and not password:
+                user, password = SOCKS_USER, random_password()
+            elif user and not password:
+                password = random_password()
+            user, password, errors = validate_login(user, password, allow_empty=False)
+            if errors:
+                raise SSHError("; ".join(errors))
+            return socks_env(port, user, password)
+        if protocol == "mtproxy":
+            cleaned, errors = validate_proxy_fields({
+                "port": str(port),
+                "transport_mode": fields.get("transport_mode") or "standard",
+                "tls_domain": fields.get("tls_domain") or MTPROXY_DOMAIN,
+                "public_host": fields.get("public_host") or "",
+                "tag": "",
+                "additional_secrets": "",
+                "workers_mode": "auto",
+                "workers": "2",
+            }, "mtproxy")
+            if errors:
+                raise SSHError("; ".join(errors))
+            return mtproxy_env(cleaned, "", regenerate=True)
+        if protocol == "telemt":
+            cleaned, errors = validate_proxy_fields({
+                "port": str(port),
+                "transport_mode": fields.get("transport_mode") or "standard",
+                "tls_domain": fields.get("tls_domain") or MTPROXY_DOMAIN,
+                "public_host": fields.get("public_host") or "",
+                "tag": "",
+                "additional_secrets": "",
+                "mask": "1",
+                "use_middle_proxy": "1",
+                "user_name": TELEMT_USER,
+            }, "telemt")
+            if errors:
+                raise SSHError("; ".join(errors))
+            return telemt_env(cleaned, "", regenerate=True)
+        if protocol == "tproxy":
+            cleaned, errors = validate_tproxy({
+                "hostname": fields.get("hostname") or "",
+                "acme_email": fields.get("acme_email") or "",
+                "carrier_mode": "https",
+                "workers": "1",
+                "http_port": "80",
+                "https_port": "443",
+            })
+            if errors:
+                raise SSHError("; ".join(errors))
+            return tproxy_env(cleaned, "", regenerate=True)
+        return {}
 
+    def _install_from_scripts(self, name: str, script_dir: str, variables: dict, port: int) -> None:
         folder = variables["$DOCKERFILE_FOLDER"]
         sudo = "" if self.docker == "docker" else "sudo "
+        dockerfile = self._script_text(script_dir, "Dockerfile")
+        run_script = self._subst(self._script_text(script_dir, "run_container.sh"), variables)
+        configure = self._subst(self._script_text(script_dir, "configure_container.sh"), variables)
+        start = self._subst(self._script_text(script_dir, "start.sh"), variables)
 
-        def host(cmd: str, timeout: int | None = None, input_data: str | None = None):
-            code, out, err = self.ssh.run(cmd, timeout=timeout or self.timeout, input_data=input_data)
-            if code != 0:
-                raise SSHError((err.strip() or out.strip() or f"Ошибка: {cmd}")[-2000:])
-            return out
-
-        try:
-            # prepare_host.sh
-            host(f"{sudo}mkdir -p {folder} && {sudo}sysctl -w net.ipv4.ip_forward=1 >/dev/null")
-            host(
-                f"{self.docker} network ls | grep -q amnezia-dns-net || "
-                f"{self.docker} network create --driver bridge --subnet=172.29.172.0/24 "
-                f"--opt com.docker.network.bridge.name=amn0 amnezia-dns-net"
+        self._host(f"{sudo}mkdir -p {folder} && {sudo}sysctl -w net.ipv4.ip_forward=1 >/dev/null")
+        self._host(
+            f"{self.docker} network ls | grep -q amnezia-dns-net || "
+            f"{self.docker} network create --driver bridge --subnet=172.29.172.0/24 "
+            f"--opt com.docker.network.bridge.name=amn0 amnezia-dns-net"
+        )
+        self._host(f"{sudo}tee {folder}/Dockerfile >/dev/null", input_data=dockerfile)
+        self._host(
+            f"{self.docker} build --no-cache --pull -t {name} {folder} 2>&1",
+            timeout=self.install_timeout,
+        )
+        out = self._host("bash -s 2>&1", timeout=self.install_timeout, input_data=run_script)
+        if "already in use" in out or "address already in use" in out:
+            raise SSHError(f"Порт {port} уже занят")
+        code, out, err = self._script(name, configure, timeout=self.install_timeout)
+        if code != 0:
+            raise SSHError(err.strip() or out.strip() or "configure_container.sh завершился с ошибкой")
+        if start.strip():
+            self._write(name, "/opt/amnezia/start.sh", start)
+            self._host(
+                f"{self.docker} exec -d {name} sh -c "
+                f"\"chmod a+x /opt/amnezia/start.sh && /opt/amnezia/start.sh\""
             )
-            # build_container.sh
-            host(f"{sudo}tee {folder}/Dockerfile >/dev/null", input_data=read("Dockerfile"))
-            host(f"{self.docker} build --no-cache --pull -t {name} {folder} 2>&1",
-                 timeout=self.install_timeout)
-            # run_container.sh
-            run_script = subst(read("run_container.sh"))
-            out = host(f"bash -s 2>&1", timeout=self.install_timeout, input_data=run_script)
-            if "already in use" in out or "address already in use" in out:
-                raise SSHError(f"Порт {port} уже занят")
-            # configure_container.sh — внутри контейнера
-            code, out, err = self._script(name, subst(read("configure_container.sh")))
-            if code != 0:
-                raise SSHError(err.strip() or out.strip() or "configure_container.sh завершился с ошибкой")
-            # start.sh
-            self._write(name, "/opt/amnezia/start.sh", subst(read("start.sh")))
-            host(f"{self.docker} exec -d {name} sh -c "
-                 f"\"chmod a+x /opt/amnezia/start.sh && /opt/amnezia/start.sh\"")
-            self._write(name, self._table_path(name), "[]")
+
+    def _write_initial_xray_config(self, name: str, port: int) -> None:
+        private_key = self._read(name, f"{XRAY_DIR}/xray_private.key").strip()
+        public_key = self._read(name, f"{XRAY_DIR}/xray_public.key").strip()
+        short_id = self._read(name, f"{XRAY_DIR}/xray_short_id.key").strip()
+        client_id = self._read(name, f"{XRAY_DIR}/xray_uuid.key").strip()
+        if not (private_key and public_key and short_id and client_id):
+            raise SSHError("XRay не сгенерировал ключи Reality")
+        config = default_xray_server(port, private_key, short_id, client_id)
+        self._write(name, XRAY_SERVER_CONFIG, json.dumps(config, indent=2) + "\n")
+
+    def _script_text(self, script_dir: str, filename: str) -> str:
+        path = os.path.join(SCRIPTS_DIR, script_dir, filename)
+        if not os.path.isfile(path):
+            return ""
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def _subst(self, text: str, variables: dict) -> str:
+        for key in sorted(variables, key=len, reverse=True):
+            text = text.replace(key, variables[key])
+        return text.replace("sudo docker", self.docker)
+
+    def _host(self, cmd: str, timeout: int | None = None, input_data: str | None = None) -> str:
+        code, out, err = self.ssh.run(cmd, timeout=timeout or self.timeout, input_data=input_data)
+        if code != 0:
+            raise SSHError((err.strip() or out.strip() or f"Ошибка: {cmd}")[-2000:])
+        return out
+
+    # ------------------------------------------------------------------
+    # Редактор настроек соединения
+    # ------------------------------------------------------------------
+
+    def connection_settings(self, container: str) -> dict:
+        if not self._validate_container(container):
+            return {"ok": False, "error": "Контейнер не разрешён"}
+        if not self.container_running(container):
+            return {"ok": False, "error": f"Контейнер {container} не запущен"}
+        kind = self._settings_kind(container)
+        if kind is None:
+            return {"ok": False, "error": "Для этого контейнера нет редактора настроек"}
+        try:
+            values = self._read_settings_values(container, kind)
         except SSHError as exc:
             return {"ok": False, "error": str(exc)}
+        form = service_form(kind, values) if kind in SERVICE_KINDS else settings_form(kind, values)
+        form.update({"ok": True, "protocol": kind, "container": container, "values": values})
+        return form
 
-        time.sleep(2)
-        return {"ok": True, "container": name, "protocol": protocol, "port": port}
+    def update_connection_settings(self, container: str, fields: dict) -> dict:
+        if not self._validate_container(container):
+            return {"ok": False, "error": "Контейнер не разрешён"}
+        if not self.container_running(container):
+            return {"ok": False, "error": f"Контейнер {container} не запущен"}
+        kind = self._settings_kind(container)
+        if kind is None:
+            return {"ok": False, "error": "Для этого контейнера нет редактора настроек"}
+        if kind in ("dns", "tor"):
+            return {"ok": False, "error": "У этой службы нет изменяемых настроек"}
+        try:
+            if kind in ("awg", "wireguard"):
+                self._update_wg_settings(container, fields, awg=kind == "awg")
+            elif kind == "openvpn":
+                self._update_openvpn_settings(container, fields)
+            elif kind == "xray":
+                self._update_xray_settings(container, fields)
+            elif kind == "ipsec":
+                self._update_ipsec_settings(container, fields)
+            elif kind == "sftp":
+                self._update_sftp_settings(container, fields)
+            elif kind == "socks5":
+                self._update_socks_settings(container, fields)
+            elif kind == "mtproxy":
+                self._update_mtproxy_settings(container, fields)
+            elif kind == "telemt":
+                self._update_telemt_settings(container, fields)
+            elif kind == "tproxy":
+                self._update_tproxy_settings(container, fields)
+        except SSHError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
+    def remove_container(self, container: str) -> dict:
+        if not self._validate_container(container):
+            return {"ok": False, "error": "Контейнер не разрешён"}
+        if not self.container_exists(container):
+            return {"ok": False, "error": "Контейнер не найден"}
+        try:
+            self._host(f"{self.docker} stop {container} && {self.docker} rm -f {container}")
+            self._host(f"{self.docker} rmi {container} >/dev/null 2>&1 || true")
+        except SSHError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
+    def _settings_kind(self, container: str) -> str | None:
+        if container in WG_PROFILES:
+            return "awg" if WG_PROFILES[container]["awg"] else "wireguard"
+        return {
+            "amnezia-openvpn": "openvpn",
+            "amnezia-xray": "xray",
+            "amnezia-ipsec": "ipsec",
+            "amnezia-dns": "dns",
+            "amnezia-sftp": "sftp",
+            "amnezia-socks5proxy": "socks5",
+            "amnezia-mtproxy": "mtproxy",
+            "amnezia-telemt": "telemt",
+            "amnezia-tproxy": "tproxy",
+            "amnezia-torwebsite": "tor",
+        }.get(container)
+
+    def _read_settings_values(self, container: str, kind: str) -> dict:
+        if kind in SERVICE_KINDS:
+            return self._read_service_values(container, kind)
+        if kind in ("awg", "wireguard"):
+            prof = WG_PROFILES[container]
+            conf = self._read(container, prof["conf"])
+            if not conf.strip():
+                raise SSHError(f"Не найден {prof['conf']}")
+            interface, _peers = _parse_wg_conf(conf)
+            opts = self._read_json(container, f"{prof['dir']}/panel_client_opts.json")
+            return wg_form_values(interface, kind == "awg", str(opts.get("mtu") or DEFAULT_MTU))
+        if kind == "openvpn":
+            conf = self._read(container, f"{OPENVPN_DIR}/server.conf")
+            if not conf.strip():
+                raise SSHError("Не найден /opt/amnezia/openvpn/server.conf")
+            return openvpn_form_values(conf, self._read_json(container, f"{OPENVPN_DIR}/panel_client_opts.json"))
+        if kind == "xray":
+            return xray_form_values(self._xray_config(container))
+        ipsec_conf = self._read(container, "/etc/ipsec.conf")
+        if not ipsec_conf.strip():
+            ipsec_conf = self._read(container, "/etc/ipsec.d/ikev2.conf")
+        ppp = self._read(container, "/etc/ppp/options.xl2tpd")
+        if not ipsec_conf.strip() and not ppp.strip():
+            raise SSHError("Не найден конфиг IPsec")
+        return ipsec_form_values(ipsec_conf, ppp)
+
+    def _read_service_values(self, container: str, kind: str) -> dict:
+        host = self.ssh.host
+        if kind == "dns":
+            return {}
+        if kind == "tor":
+            return {"hostname": self._read(container, "/var/lib/tor/hidden_service/hostname").strip()}
+        if kind == "sftp":
+            user, password = parse_sftp_cmd(self._inspect_cmd(container))
+            return {
+                "host": host,
+                "port": self._host_port_for(container, "22") or "222",
+                "username": user,
+                "password": password,
+            }
+        if kind == "socks5":
+            values = parse_socks(self._read(container, "/usr/local/3proxy/conf/3proxy.cfg"))
+            published = self._host_port_for(container, values["port"])
+            if published:
+                values["port"] = published
+            return values
+        if kind == "mtproxy":
+            values = mtproxy_values(
+                self._read(container, "/data/mtproxy-meta"),
+                self._read(container, "/data/secret"),
+                host,
+            )
+            published = self._first_host_port(container)
+            if published:
+                values["port"] = published
+            return values
+        if kind == "telemt":
+            return telemt_values(
+                self._read(container, "/data/config.toml"),
+                self._read(container, "/data/secret"),
+                host,
+            )
+        return tproxy_values(
+            self._read(container, "/data/tproxy-meta"),
+            self._read(container, "/data/secret"),
+        )
+
+    def _inspect_cmd(self, container: str) -> str:
+        code, out, _ = self.ssh.run(
+            f"{self.docker} inspect -f '{{{{json .Config.Cmd}}}}' {container}",
+            timeout=self.timeout,
+        )
+        return out if code == 0 else ""
+
+    def _port_bindings(self, container: str) -> dict:
+        code, out, _ = self.ssh.run(
+            f"{self.docker} inspect -f '{{{{json .HostConfig.PortBindings}}}}' {container}",
+            timeout=self.timeout,
+        )
+        if code != 0 or not out.strip() or out.strip() == "null":
+            return {}
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _host_port_for(self, container: str, container_port: str, proto: str = "tcp") -> str:
+        entries = self._port_bindings(container).get(f"{container_port}/{proto}") or []
+        if isinstance(entries, list) and entries:
+            return str(entries[0].get("HostPort") or "")
+        return ""
+
+    def _first_host_port(self, container: str) -> str:
+        for entries in self._port_bindings(container).values():
+            if isinstance(entries, list) and entries and entries[0].get("HostPort"):
+                return str(entries[0]["HostPort"])
+        return ""
+
+    @staticmethod
+    def _require_port(value, label: str = "Порт") -> str:
+        text = str(value or "").strip()
+        if not text.isdigit() or not 1 <= int(text) <= 65535:
+            raise SSHError(f"{label} должен быть числом от 1 до 65535")
+        return str(int(text))
+
+    def _reconfigure(self, container: str, script_dir: str, variables: dict) -> None:
+        script = self._subst(self._script_text(script_dir, "configure_container.sh"), variables)
+        if not script.strip():
+            return
+        code, out, err = self._script(container, script, timeout=self.install_timeout)
+        if code != 0:
+            raise SSHError(err.strip() or out.strip() or "configure_container.sh завершился с ошибкой")
+
+    def _restart(self, container: str) -> None:
+        self._host(f"{self.docker} restart {container}", timeout=self.install_timeout)
+
+    def _update_sftp_settings(self, container: str, fields: dict) -> None:
+        user, password, errors = validate_login(fields.get("username"), fields.get("password"), False)
+        if errors:
+            raise SSHError("; ".join(errors))
+        port = self._require_port(fields.get("port"))
+        current_user, current_password = parse_sftp_cmd(self._inspect_cmd(container))
+        current_port = self._host_port_for(container, "22") or port
+        if (user, password, port) == (current_user, current_password, current_port):
+            return
+        self._recreate_published(
+            container,
+            [(port, "22", "tcp")],
+            "--log-driver none --restart always",
+            backup=False,
+            command=f"{user}:{password}:::upload",
+        )
+
+    def _update_socks_settings(self, container: str, fields: dict) -> None:
+        user, password, errors = validate_login(fields.get("username"), fields.get("password"), True)
+        if errors:
+            raise SSHError("; ".join(errors))
+        port = self._require_port(fields.get("port"))
+        current = parse_socks(self._read(container, "/usr/local/3proxy/conf/3proxy.cfg"))
+        published = self._host_port_for(container, current["port"] or port) or current["port"]
+        if port != published:
+            self._recreate_published(
+                container,
+                [(port, "tcp")],
+                "--restart always",
+                backup=False,
+            )
+        variables = {
+            "$CONTAINER_NAME": container,
+            "$SERVER_IP_ADDRESS": self.ssh.host,
+            **socks_env(port, user, password),
+        }
+        self._reconfigure(container, "socks5_proxy", variables)
+        self._rewrite_start(container, variables)
+        self._restart(container)
+
+    def _proxy_base(self, container: str, extra: dict) -> dict:
+        return {
+            "$CONTAINER_NAME": container,
+            "$SERVER_IP_ADDRESS": self.ssh.host,
+            **extra,
+        }
+
+    def _update_mtproxy_settings(self, container: str, fields: dict) -> None:
+        cleaned, errors = validate_proxy_fields(fields, "mtproxy")
+        if errors:
+            raise SSHError("; ".join(errors))
+        secret = self._read(container, "/data/secret").strip()
+        variables = self._proxy_base(container, mtproxy_env(cleaned, secret, regenerate=False))
+        current_port = self._first_host_port(container)
+        if current_port and cleaned["port"] != current_port:
+            self._recreate_published(
+                container,
+                [(cleaned["port"], "tcp")],
+                "--log-driver none --restart always -v amnezia-mtproxy-data:/data",
+                backup=False,
+            )
+        self._reconfigure(container, "mtproxy", variables)
+        self._rewrite_start(container, variables)
+        self._restart(container)
+
+    def _update_telemt_settings(self, container: str, fields: dict) -> None:
+        cleaned, errors = validate_proxy_fields(fields, "telemt")
+        if errors:
+            raise SSHError("; ".join(errors))
+        secret = self._read(container, "/data/secret").strip()
+        variables = self._proxy_base(container, telemt_env(cleaned, secret, regenerate=False))
+        current_port = self._first_host_port(container)
+        if current_port and cleaned["port"] != current_port:
+            self._recreate_published(
+                container,
+                [(cleaned["port"], "tcp")],
+                "--log-driver none --restart always --ulimit nofile=65536:65536 "
+                "-v amnezia-telemt-data:/data",
+                backup=False,
+            )
+        self._reconfigure(container, "telemt", variables)
+        self._rewrite_start(container, variables)
+        self._restart(container)
+
+    def _update_tproxy_settings(self, container: str, fields: dict) -> None:
+        cleaned, errors = validate_tproxy(fields)
+        if errors:
+            raise SSHError("; ".join(errors))
+        secret = self._read(container, "/data/secret").strip()
+        current = tproxy_values(self._read(container, "/data/tproxy-meta"), secret)
+        variables = self._proxy_base(container, tproxy_env(cleaned, secret, regenerate=False))
+        http_pub = self._host_port_for(container, "80")
+        https_pub = self._host_port_for(container, "443")
+        ports_changed = (
+            cleaned["http_port"] != str(current.get("http_port") or "")
+            or cleaned["https_port"] != str(current.get("https_port") or "")
+            or (bool(http_pub) and http_pub != cleaned["http_port"])
+            or (bool(https_pub) and https_pub != cleaned["https_port"])
+        )
+        if ports_changed:
+            self._recreate_published(
+                container,
+                [(cleaned["http_port"], "80", "tcp"), (cleaned["https_port"], "443", "tcp")],
+                "--log-driver none --restart always -v amnezia-tproxy-data:/data",
+                backup=False,
+            )
+        self._reconfigure(container, "tproxy", variables)
+        self._rewrite_start(container, variables)
+        self._restart(container)
+
+    def _update_wg_settings(self, container: str, fields: dict, awg: bool) -> None:
+        prof = WG_PROFILES[container]
+        current = self._read(container, prof["conf"])
+        interface, _peers = _parse_wg_conf(current)
+        old_port = interface.get("ListenPort", "")
+        rendered, errors = apply_wg_settings(current, fields, awg)
+        if errors:
+            raise SSHError("; ".join(errors))
+        rendered_iface = _parse_wg_conf(rendered)[0]
+        new_port = rendered_iface.get("ListenPort", "")
+        address, prefix = rendered_iface.get("Address", "10.8.1.0/24").split("/", 1)
+        opts_path = f"{prof['dir']}/panel_client_opts.json"
+        opts = self._read_json(container, opts_path)
+        opts["mtu"] = str(fields.get("mtu") or DEFAULT_MTU)
+        if new_port != old_port:
+            self._recreate_published(
+                container,
+                [(new_port, "udp")],
+                self._wg_run_args(),
+            )
+        self._write(container, prof["conf"], rendered)
+        self._write(container, opts_path, json.dumps(opts, indent=2) + "\n")
+        self._rewrite_start(container, {
+            "$AWG_SUBNET_IP": address,
+            "$WIREGUARD_SUBNET_IP": address,
+            "$WIREGUARD_SUBNET_CIDR": prefix,
+            "$AWG_SERVER_PORT": new_port,
+            "$WIREGUARD_SERVER_PORT": new_port,
+        })
+        self._host(f"{self.docker} restart {container}", timeout=self.install_timeout)
+
+    def _update_openvpn_settings(self, container: str, fields: dict) -> None:
+        current = self._read(container, f"{OPENVPN_DIR}/server.conf")
+        old = openvpn_form_values(current)
+        rendered, client_opts, errors = render_openvpn_conf(fields)
+        if errors:
+            raise SSHError("; ".join(errors))
+        new = openvpn_form_values(rendered, client_opts)
+        if old.get("port") != new["port"] or old.get("proto") != new["proto"]:
+            self._recreate_published(container, [(new["port"], new["proto"])], self._openvpn_run_args())
+        self._write(container, f"{OPENVPN_DIR}/server.conf", rendered)
+        self._write(
+            container,
+            f"{OPENVPN_DIR}/panel_client_opts.json",
+            json.dumps(client_opts, indent=2) + "\n",
+        )
+        address, prefix = new["subnet"].split("/")
+        self._rewrite_start(container, {
+            "$OPENVPN_SUBNET_IP": address,
+            "$OPENVPN_SUBNET_CIDR": prefix,
+            "$OPENVPN_PORT": new["port"],
+            "$SERVER_IP_ADDRESS": self.ssh.host,
+        })
+        self._host(f"{self.docker} restart {container}", timeout=self.install_timeout)
+
+    def _update_xray_settings(self, container: str, fields: dict) -> None:
+        config = self._xray_config(container)
+        old_port = str(xray_form_values(config).get("port") or "")
+        security = str(fields.get("security") or "")
+        if security == "tls":
+            self._ensure_xray_tls(container)
+        private_key = self._read(container, f"{XRAY_DIR}/xray_private.key").strip()
+        short_id = self._read(container, f"{XRAY_DIR}/xray_short_id.key").strip()
+        payload = dict(fields)
+        payload["_private_key"] = private_key
+        payload["_short_id"] = short_id
+        updated, errors = apply_xray_settings(config, payload)
+        if errors:
+            raise SSHError("; ".join(errors))
+        new_port = str(xray_form_values(updated).get("port") or "")
+        if new_port != old_port:
+            self._recreate_published(
+                container,
+                [(new_port, "tcp"), (new_port, "udp")],
+                "--privileged --log-driver none --restart always --cap-add=NET_ADMIN "
+                f"-v {container}-data:/opt/amnezia/xray",
+            )
+        self._rewrite_start(container, {"$XRAY_SERVER_PORT": new_port})
+        backup = self._read(container, XRAY_SERVER_CONFIG)
+        self._apply_xray_config(container, updated, backup)
+
+    def _update_ipsec_settings(self, container: str, fields: dict) -> None:
+        primary = str(fields.get("primary_dns", "")).strip()
+        secondary = str(fields.get("secondary_dns", "")).strip()
+        if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", primary):
+            raise SSHError("Некорректный основной DNS")
+        if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", secondary):
+            raise SSHError("Некорректный второй DNS")
+        for path in ("/etc/ipsec.conf", "/etc/ipsec.d/ikev2.conf", "/etc/ppp/options.xl2tpd"):
+            current = self._read(container, path)
+            if not current.strip():
+                continue
+            self._write(container, path, apply_ipsec_dns(current, primary, secondary))
+        self._host(f"{self.docker} restart {container}", timeout=self.install_timeout)
+
+    def _ensure_xray_tls(self, container: str) -> None:
+        cert = self._read(container, f"{XRAY_DIR}/tls_cert.pem")
+        key = self._read(container, f"{XRAY_DIR}/tls_key.pem")
+        if "BEGIN" in cert and "BEGIN" in key:
+            return
+        script = (
+            f"openssl req -x509 -newkey rsa:2048 -nodes -days 3650 "
+            f"-keyout {XRAY_DIR}/tls_key.pem -out {XRAY_DIR}/tls_cert.pem "
+            f"-subj /CN=www.googletagmanager.com"
+        )
+        code, out, err = self._exec(container, script, timeout=self.install_timeout)
+        if code != 0:
+            raise SSHError(err.strip() or out.strip() or "Не удалось выпустить TLS-сертификат XRay")
+
+    def _wg_run_args(self) -> str:
+        return (
+            "--log-driver none --restart always --privileged "
+            "--cap-add=NET_ADMIN --cap-add=SYS_MODULE "
+            "-v /lib/modules:/lib/modules --sysctl=net.ipv4.conf.all.src_valid_mark=1"
+        )
+
+    def _openvpn_run_args(self) -> str:
+        return "--privileged --log-driver none --restart always --cap-add=NET_ADMIN"
+
+    def _recreate_published(
+        self,
+        container: str,
+        publishes: list[tuple],
+        run_args: str,
+        *,
+        backup: bool = True,
+        command: str = "",
+    ) -> None:
+        """Пересоздаёт контейнер с новыми проброшенными портами.
+
+        VPN-контейнеры сохраняют /opt/amnezia. У служб без tar и без этого
+        каталога архив не нужен: данные MTProxy, Telemt и TProxy лежат в томе.
+        """
+        code, image, err = self.ssh.run(
+            f"{self.docker} inspect -f '{{{{.Config.Image}}}}' {container}",
+            timeout=self.timeout,
+        )
+        image = image.strip()
+        if code != 0 or not image:
+            raise SSHError(err.strip() or "Не удалось узнать образ контейнера")
+        archive = ""
+        if backup:
+            code, archive, err = self.ssh.run(
+                f"{self.docker} exec {container} tar -C / -czf - opt/amnezia | base64 -w 0",
+                timeout=self.install_timeout,
+            )
+            if code != 0 or not archive.strip():
+                raise SSHError(err.strip() or "Не удалось сохранить файлы контейнера перед сменой порта")
+        parked = f"{container}-replacing"
+        self._host(f"{self.docker} rename {container} {parked}")
+        publish = publish_flags(publishes)
+        suffix = f" {shlex.quote(command)}" if command else ""
+        try:
+            self._host(
+                f"{self.docker} run -d {run_args} {publish} --name {container} {image}{suffix}",
+                timeout=self.install_timeout,
+            )
+            if archive.strip():
+                self._host(
+                    f"base64 -d | {self.docker} exec -i {container} tar -C / -xzf -",
+                    timeout=self.install_timeout,
+                    input_data=archive.strip(),
+                )
+            self.ssh.run(
+                f"{self.docker} network connect amnezia-dns-net {container} >/dev/null 2>&1 || true",
+                timeout=self.timeout,
+            )
+        except SSHError:
+            self.ssh.run(f"{self.docker} rm -f {container} >/dev/null 2>&1 || true", timeout=self.timeout)
+            self.ssh.run(f"{self.docker} rename {parked} {container} >/dev/null 2>&1 || true", timeout=self.timeout)
+            raise
+        self.ssh.run(f"{self.docker} rm -f {parked} >/dev/null 2>&1 || true", timeout=self.timeout)
+
+    def _rewrite_start(self, container: str, variables: dict) -> None:
+        script_name = {
+            "amnezia-awg2": "awg/start.sh",
+            "amnezia-awg": "awg_legacy/start.sh",
+            "amnezia-wireguard": "wireguard/start.sh",
+            "amnezia-openvpn": "openvpn/start.sh",
+            "amnezia-xray": "xray/start.sh",
+            "amnezia-socks5proxy": "socks5_proxy/start.sh",
+            "amnezia-mtproxy": "mtproxy/start.sh",
+            "amnezia-telemt": "telemt/start.sh",
+            "amnezia-tproxy": "tproxy/start.sh",
+        }.get(container)
+        if not script_name:
+            return
+        directory, filename = script_name.split("/", 1)
+        text = self._subst(self._script_text(directory, filename), variables)
+        if text.strip():
+            self._write(container, "/opt/amnezia/start.sh", text)
