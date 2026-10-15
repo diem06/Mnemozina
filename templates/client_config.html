@@ -16,16 +16,18 @@
     </p>
 
     <p class="hint" style="margin-bottom: 12px;">
-        Скопируйте конфиг и сохраните его — после закрытия страницы он
-        не будет показан снова: приватный ключ клиента на сервере не хранится.
-        Файл .conf импортируется в AmneziaVPN / AmneziaWG.
+        Это ссылка для подключения. Её можно скопировать или открыть как QR.
+        Позже те же кнопки есть в списке клиентов.
     </p>
 
     <textarea id="client-config" class="config-output" readonly rows="16">{{ config }}</textarea>
 
     <div class="config-actions">
-        <button type="button" class="btn btn-primary" onclick="copyConfig()">
-            Скопировать
+        <button type="button" class="btn btn-primary" onclick="copyConfig(this)">
+            Копировать ссылку
+        </button>
+        <button type="button" class="btn btn-ghost" onclick="showCreatedQr()">
+            QR
         </button>
         <button type="button" class="btn btn-ghost" onclick="downloadConfig()">
             Скачать файл
@@ -34,20 +36,41 @@
            class="btn btn-ghost">Готово</a>
     </div>
 </div>
+
+<div id="share-modal" class="modal hidden">
+    <div class="modal-content share-modal">
+        <div class="modal-header">
+            <h2 id="share-title">Подключение</h2>
+            <button type="button" class="btn btn-ghost" onclick="closeShare()">Закрыть</button>
+        </div>
+        <div class="share-body">
+            <div id="share-qr"></div>
+            <p id="share-error" class="flash flash-error hidden"></p>
+            <textarea id="share-link" class="config-output" readonly rows="6"></textarea>
+            <div class="config-actions">
+                <button type="button" class="btn btn-primary" onclick="copyShareLink()">
+                    Копировать ссылку
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='qrcode.js') }}"></script>
+<script src="{{ url_for('static', filename='client-share.js') }}"></script>
 <script>
-function copyConfig() {
-    const ta = document.getElementById('client-config');
-    ta.select();
-    ta.setSelectionRange(0, ta.value.length);
-    navigator.clipboard.writeText(ta.value).then(() => {
-        alert('Конфиг скопирован в буфер обмена');
-    }).catch(() => {
-        document.execCommand('copy');
-        alert('Конфиг скопирован');
-    });
+function showCreatedQr() {
+    const text = document.getElementById('client-config').value;
+    openShareModal({{ client_name | tojson }}, text);
+}
+async function copyConfig(button) {
+    const text = document.getElementById('client-config').value;
+    const previous = button.textContent;
+    const ok = await copyText(text);
+    button.textContent = ok ? "Скопировано" : "Ошибка";
+    setTimeout(() => { button.textContent = previous; }, 1600);
 }
 
 function downloadConfig() {
