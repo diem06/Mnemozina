@@ -26,7 +26,7 @@ import shlex
 import string
 import time
 import uuid as uuid_module
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from ssh_manager import SSHSession, SSHError
 
@@ -384,10 +384,64 @@ class ContainerManager:
         except json.JSONDecodeError as exc:
             raise SSHError(f"Не удалось разобрать {XRAY_SERVER_CONFIG}: {exc}") from exc
 
+    def _xray_inbound(self, config: dict) -> dict:
+        """Return the VLESS inbound, preferring Reality over unrelated inbounds."""
+        inbounds = config.get("inbounds") or []
+        candidates = [i for i in inbounds if i.get("protocol", "vless") == "vless"]
+        candidates = candidates or inbounds
+        reality = [i for i in candidates if i.get("streamSettings", {}).get("security") == "reality"]
+        if reality:
+            return reality[0]
+        if candidates:
+            return candidates[0]
+        raise SSHError("В конфиге XRay нет inbounds")
+
+    def _xray_link(self, container: str, inbound: dict, client_id: str,
+                   client_name: str = "Client") -> str:
+        """Build a VLESS link from the actual inbound stream settings."""
+        stream = inbound.get("streamSettings", {}) or {}
+        network = str(stream.get("network", "tcp"))
+        security = str(stream.get("security", "none"))
+        params = {"type": network, "security": security, "encryption": "none"}
+        # flow is valid only for TCP/RAW. Existing bad flow values are ignored.
+        client = next((c for c in inbound.get("settings", {}).get("clients", [])
+                       if c.get("id") == client_id), {})
+        if network in ("tcp", "raw") and client.get("flow"):
+            params["flow"] = client["flow"]
+        reality = stream.get("realitySettings", {}) or {}
+        if security == "reality":
+            pbk = self._read(container, f"{XRAY_DIR}/xray_public.key").strip()
+            sid = self._read(container, f"{XRAY_DIR}/xray_short_id.key").strip()
+            params.update({
+                "sni": (reality.get("serverNames") or [""])[0],
+                "fp": (reality.get("fingerprint") or "chrome"),
+                "pbk": pbk,
+                "sid": sid or (reality.get("shortIds") or [""])[0],
+            })
+        sock = stream.get("xhttpSettings", {}) or {}
+        if network == "xhttp":
+            params["path"] = sock.get("path") or "/"
+            params["mode"] = sock.get("mode") or "auto"
+            if sock.get("host"):
+                params["host"] = sock["host"]
+        elif network == "ws":
+            ws = stream.get("wsSettings", {}) or {}
+            params["path"] = ws.get("path") or "/"
+            headers = ws.get("headers", {}) or {}
+            if headers.get("Host") or headers.get("host"):
+                params["host"] = headers.get("Host") or headers.get("host")
+        elif network == "grpc":
+            grpc = stream.get("grpcSettings", {}) or {}
+            if grpc.get("serviceName"):
+                params["serviceName"] = grpc["serviceName"]
+        query = urlencode(params, quote_via=quote)
+        return (f"vless://{quote(str(client_id), safe='')}@{self._server_host()}"
+                f":{inbound.get('port', 443)}?{query}#{quote(client_name, safe='')}")
+
     def _list_xray_clients(self, container: str) -> list[dict]:
         config = self._xray_config(container)
-        inbounds = config.get("inbounds") or [{}]
-        clients = inbounds[0].get("settings", {}).get("clients", [])
+        inbound = self._xray_inbound(config)
+        clients = inbound.get("settings", {}).get("clients", [])
         ids = [c.get("id") for c in clients if c.get("id")]
         own = self._read(container, f"{XRAY_DIR}/xray_uuid.key").strip()
         extra = {own: {"name_hint": "основной конфиг"}} if own else {}
@@ -421,6 +475,36 @@ class ContainerManager:
         except SSHError as exc:
             return fail(str(exc))
         return fail(f"Протокол {protocol} не поддерживает клиентов")
+
+    def _apply_xray_config(self, container: str, config: dict, backup: str) -> None:
+        """Validate, atomically install, restart, verify; restore on any failure."""
+        serialized = json.dumps(config, indent=4, ensure_ascii=False) + "\n"
+        temp = XRAY_SERVER_CONFIG + ".new.json"
+        self._write(container, temp, serialized)
+        # Resolve the binary inside the same container; installations differ by image.
+        test = ("bin=$(command -v xray 2>/dev/null || find /usr/local/bin /usr/bin /opt -type f -name xray 2>/dev/null | head -1); "
+                "[ -n \"$bin\" ] || { echo 'xray binary not found' >&2; exit 127; }; "
+                f"$bin run -test -format json -c {shlex.quote(temp)}")
+        code, out, err = self._exec(container, f"sh -c {shlex.quote(test)}", timeout=self.install_timeout)
+        if code != 0:
+            raise SSHError(err.strip() or out.strip() or "Проверка конфигурации XRay не пройдена")
+        self._write(container, XRAY_SERVER_CONFIG + ".bak", backup)
+        try:
+            mv = f"mv {shlex.quote(temp)} {shlex.quote(XRAY_SERVER_CONFIG)}"
+            code, out, err = self._exec(container, f"sh -c {shlex.quote(mv)}")
+            if code != 0:
+                raise SSHError(err.strip() or out.strip() or "Не удалось установить конфиг XRay")
+            code, out, err = self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+            if code != 0 or not self._xray_process_running(container):
+                raise SSHError(err.strip() or out.strip() or "XRay не запустился после обновления")
+        except SSHError:
+            self._write(container, XRAY_SERVER_CONFIG, backup)
+            self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+            raise
+
+    def _xray_process_running(self, container: str) -> bool:
+        code, out, _ = self._exec(container, "sh -c 'pgrep -x xray >/dev/null || pidof xray >/dev/null'")
+        return code == 0
 
     def _gen_wg_keys(self, container: str) -> tuple[str, str]:
         prof = WG_PROFILES[container]
@@ -528,7 +612,7 @@ class ContainerManager:
 
     @staticmethod
     def _safe_filename(name: str) -> str:
-        return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "client"
+        return re.sub(r"[^\w.\-]+", "_", name).strip("._") or "client"
 
     @staticmethod
     def _pem_only(text: str) -> str:
@@ -595,45 +679,60 @@ class ContainerManager:
 
     def _add_xray_client(self, container: str, client_name: str) -> dict:
         config = self._xray_config(container)
-        inbounds = config.get("inbounds") or []
-        if not inbounds:
-            raise SSHError("В конфиге XRay нет inbounds")
-        inbound = inbounds[0]
-        stream = inbound.get("streamSettings", {})
-        security = stream.get("security", "none")
+        inbound = self._xray_inbound(config)
+        stream = inbound.get("streamSettings", {}) or {}
         network = stream.get("network", "tcp")
         clients = inbound.setdefault("settings", {}).setdefault("clients", [])
-        flow = next((c.get("flow") for c in clients if c.get("flow")), None)
-        if flow is None and security == "reality" and network in ("tcp", "raw"):
-            flow = "xtls-rprx-vision"
-
+        # Repair all legacy clients: vision flow is never valid for XHTTP/WS/gRPC.
+        if network not in ("tcp", "raw"):
+            for client in clients:
+                client.pop("flow", None)
         client_id = str(uuid_module.uuid4())
         entry = {"id": client_id}
-        if flow:
-            entry["flow"] = flow
+        if network in ("tcp", "raw"):
+            entry["flow"] = "xtls-rprx-vision"
         clients.append(entry)
-
-        self._write(container, XRAY_SERVER_CONFIG, json.dumps(config, indent=4))
-        self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+        backup = self._read(container, XRAY_SERVER_CONFIG)
+        self._apply_xray_config(container, config, backup)
         self._table_add(container, client_id, client_name)
-
-        reality = stream.get("realitySettings", {})
-        pbk = self._read(container, f"{XRAY_DIR}/xray_public.key").strip()
-        sid = self._read(container, f"{XRAY_DIR}/xray_short_id.key").strip() or \
-            (reality.get("shortIds") or [""])[0]
-        sni = (reality.get("serverNames") or [""])[0]
-        port = inbound.get("port", 443)
-
-        params = [f"type={network}", f"security={security}", "encryption=none"]
-        if flow:
-            params.append(f"flow={flow}")
-        if security == "reality":
-            params += [f"sni={sni}", "fp=chrome", f"pbk={pbk}", f"sid={sid}"]
-        link = f"vless://{client_id}@{self._server_host()}:{port}?{'&'.join(params)}#{quote(client_name)}"
         return {
-            "ok": True, "client": client_name, "config": link,
-            "filename": f"{self._safe_filename(client_name)}.txt", "error": None,
+            "ok": True,
+            "client": client_name,
+            "config": self._xray_link(container, inbound, client_id, client_name),
+            "filename": f"{self._safe_filename(client_name)}.txt",
+            "error": None,
         }
+
+    def edit_client(self, container: str, client_id: str, client_name: str) -> dict:
+        """Изменяет отображаемое имя, не меняя протокольные ключи/идентификатор."""
+        if not self._validate_container(container) or not client_id:
+            return {"ok": False, "error": "Некорректные параметры клиента"}
+        if not self.validate_client_name(client_name):
+            return {"ok": False, "error": f"Имя клиента: от 1 до {CLIENT_NAME_MAX} символов"}
+        table = self._load_table(container)
+        found = False
+        for item in table:
+            if item.get("clientId") == client_id:
+                item.setdefault("userData", {})["clientName"] = client_name
+                found = True
+                break
+        if not found:
+            table.append({
+                "clientId": client_id,
+                "userData": {"clientName": client_name, "creationDate": _now_str()},
+            })
+        self._save_table(container, table)
+        return {"ok": True}
+
+    def client_config(self, container: str, client_id: str, client_name: str = "Client") -> dict:
+        """Возвращает конфиг существующего клиента через общий builder."""
+        if self.protocol_of(container) != "xray":
+            return {"ok": False, "error": "Повторная выдача конфига поддержана для XRay"}
+        config = self._xray_config(container)
+        inbound = self._xray_inbound(config)
+        if any(c.get("id") == client_id for c in inbound.get("settings", {}).get("clients", [])):
+            return {"ok": True, "config": self._xray_link(container, inbound, client_id, client_name)}
+        return {"ok": False, "error": "Клиент не найден"}
 
     # ------------------------------------------------------------------
     # Удаление клиента
@@ -697,16 +796,13 @@ class ContainerManager:
 
     def _delete_xray_client(self, container: str, client_id: str) -> None:
         config = self._xray_config(container)
-        changed = False
-        for inbound in config.get("inbounds", []):
-            clients = inbound.get("settings", {}).get("clients", [])
-            new = [c for c in clients if c.get("id") != client_id]
-            if len(new) != len(clients):
-                inbound["settings"]["clients"] = new
-                changed = True
-        if changed:
-            self._write(container, XRAY_SERVER_CONFIG, json.dumps(config, indent=4))
-            self.ssh.run(f"{self.docker} restart {container}", timeout=self.install_timeout)
+        inbound = self._xray_inbound(config)
+        clients = inbound.get("settings", {}).get("clients", [])
+        new = [c for c in clients if c.get("id") != client_id]
+        if len(new) != len(clients):
+            inbound["settings"]["clients"] = new
+            backup = self._read(container, XRAY_SERVER_CONFIG)
+            self._apply_xray_config(container, config, backup)
         self._table_remove(container, client_id)
 
     # ------------------------------------------------------------------
